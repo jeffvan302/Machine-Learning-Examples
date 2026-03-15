@@ -1,0 +1,16 @@
+# Core numerical array support
+numpy
+
+# Video I/O for the Ultralytics demo
+opencv-python
+
+# Deep learning runtime used by both GUIs
+torch
+torchvision
+ultralytics
+
+# Image loading used by the rocket GUI sprite renderer
+Pillow
+
+# tkinter is required by both GUIs, but it normally ships with the standard
+# Python installer rather than being installed through pip.
