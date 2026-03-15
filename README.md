@@ -73,42 +73,6 @@ Notes:
 - `requirements.txt`
 - `rocket.png`
 
-
-## MNIST CNN Visualizer
-
-Script:
-
-```powershell
-python mnist_cnn_visualizer_gui.py
-```
-
-What it does:
-
-- Trains a configurable CNN on handwritten digits from the MNIST dataset.
-- Shows the input digit, learned convolution kernels, feature maps, dense activations, and the fixed `0-9` output layer.
-- Lets you add or remove convolution and dense layers in the GUI.
-
-How to use it:
-
-1. Launch the script.
-2. If MNIST is not present in the configured data folder, the GUI will ask whether to download it.
-3. Adjust `epochs`, `batch size`, `learning rate`, `weight decay`, `activation`, and the layer layout on the left.
-4. Press `Start / Restart` to build the current architecture and begin training.
-5. Press `Pause` to inspect individual test samples more carefully.
-6. Use `Previous`, `Next`, `Random`, or the sample index box to browse test digits while paused or after training finishes.
-
-Useful command-line options:
-
-- `--data-dir <path>`: use a different MNIST folder.
-- `--smoke-test-model`: build the network and run a tiny tensor through it without opening the GUI.
-- `--smoke-test-ui`: instantiate the GUI without the startup dataset prompt.
-
-Examples:
-
-```powershell
-python mnist_cnn_visualizer_gui.py
-```
-
 ## Forager vs Raider Deep RL GUI
 
 Script:
@@ -173,6 +137,41 @@ Useful command-line options in the script:
 - `--spawn-mode random|side|centered`
 - `--spawn-randomness standard|dramatic`
 - `--smoke-test-generations <n>`
+
+## MNIST CNN Visualizer
+
+Script:
+
+```powershell
+python mnist_cnn_visualizer_gui.py
+```
+
+What it does:
+
+- Trains a configurable CNN on handwritten digits from the MNIST dataset.
+- Shows the input digit, learned convolution kernels, feature maps, dense activations, and the fixed `0-9` output layer.
+- Lets you add or remove convolution and dense layers in the GUI.
+
+How to use it:
+
+1. Launch the script.
+2. If MNIST is not present in the configured data folder, the GUI will ask whether to download it.
+3. Adjust `epochs`, `batch size`, `learning rate`, `weight decay`, `activation`, and the layer layout on the left.
+4. Press `Start / Restart` to build the current architecture and begin training.
+5. Press `Pause` to inspect individual test samples more carefully.
+6. Use `Previous`, `Next`, `Random`, or the sample index box to browse test digits while paused or after training finishes.
+
+Useful command-line options:
+
+- `--data-dir <path>`: use a different MNIST folder.
+- `--smoke-test-model`: build the network and run a tiny tensor through it without opening the GUI.
+- `--smoke-test-ui`: instantiate the GUI without the startup dataset prompt.
+
+Examples:
+
+```powershell
+python mnist_cnn_visualizer_gui.py
+```
 
 ## Ultralytics YOLO26 Video GUI
 
