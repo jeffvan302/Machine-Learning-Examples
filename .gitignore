@@ -1,0 +1,5 @@
+runtime/
+ultralytics_runtime/
+.pt
+mnist_data/
+__pycache__/

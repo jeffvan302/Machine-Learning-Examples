@@ -72,6 +72,18 @@ class DemoConfig:
     landing_vx: float
     landing_vy: float
     landing_angle: float
+    reward_progress_scale: float
+    reward_step_penalty: float
+    reward_throttle_penalty: float
+    reward_turn_penalty: float
+    reward_out_of_bounds_penalty: float
+    reward_landing_bonus: float
+    reward_landing_fuel_bonus: float
+    reward_landing_precision_bonus: float
+    reward_landing_precision_scale: float
+    reward_crash_penalty: float
+    reward_crash_impact_penalty: float
+    reward_timeout_penalty: float
     spawn_mode: str
     spawn_randomness: str
     fps: int
@@ -165,6 +177,18 @@ def default_config() -> DemoConfig:
         landing_vx=0.055,
         landing_vy=0.060,
         landing_angle=0.28,
+        reward_progress_scale=6.0,
+        reward_step_penalty=0.020,
+        reward_throttle_penalty=0.012,
+        reward_turn_penalty=0.004,
+        reward_out_of_bounds_penalty=12.0,
+        reward_landing_bonus=25.0,
+        reward_landing_fuel_bonus=6.0,
+        reward_landing_precision_bonus=1.5,
+        reward_landing_precision_scale=3.0,
+        reward_crash_penalty=16.0,
+        reward_crash_impact_penalty=6.0,
+        reward_timeout_penalty=1.5,
         spawn_mode="random",
         spawn_randomness="dramatic",
         fps=30,
@@ -201,6 +225,20 @@ def validate_config(config: DemoConfig) -> None:
         raise ValueError("fuel_burn must be greater than 0")
     if config.pad_width <= 0.0 or config.landing_vx <= 0.0 or config.landing_vy <= 0.0 or config.landing_angle <= 0.0:
         raise ValueError("landing settings must be greater than 0")
+    if config.reward_progress_scale < 0.0:
+        raise ValueError("reward_progress_scale must be zero or greater")
+    if config.reward_step_penalty < 0.0 or config.reward_throttle_penalty < 0.0 or config.reward_turn_penalty < 0.0:
+        raise ValueError("step, throttle, and turn reward penalties must be zero or greater")
+    if config.reward_out_of_bounds_penalty < 0.0:
+        raise ValueError("reward_out_of_bounds_penalty must be zero or greater")
+    if config.reward_landing_bonus < 0.0 or config.reward_landing_fuel_bonus < 0.0:
+        raise ValueError("landing reward terms must be zero or greater")
+    if config.reward_landing_precision_bonus < 0.0 or config.reward_landing_precision_scale < 0.0:
+        raise ValueError("landing precision reward terms must be zero or greater")
+    if config.reward_crash_penalty < 0.0 or config.reward_crash_impact_penalty < 0.0:
+        raise ValueError("crash reward penalties must be zero or greater")
+    if config.reward_timeout_penalty < 0.0:
+        raise ValueError("reward_timeout_penalty must be zero or greater")
     if config.spawn_mode not in {"random", "side", "centered"}:
         raise ValueError("spawn_mode must be random, side, or centered")
     if config.spawn_randomness not in {"standard", "dramatic"}:
@@ -315,13 +353,18 @@ def step_environment(
     state.y += state.vy
 
     next_cost = landing_cost(state, config)
-    reward = (previous_cost - next_cost) * 6.0 - 0.020 - 0.012 * throttle - 0.004 * abs(turn)
+    reward = (
+        (previous_cost - next_cost) * config.reward_progress_scale
+        - config.reward_step_penalty
+        - config.reward_throttle_penalty * throttle
+        - config.reward_turn_penalty * abs(turn)
+    )
     landed = False
     done = False
     outcome: str | None = None
 
     if state.x < WORLD_X_MIN - 0.18 or state.x > WORLD_X_MAX + 0.18 or state.y > WORLD_Y_MAX + 0.25:
-        reward -= 12.0
+        reward -= config.reward_out_of_bounds_penalty
         done = True
         outcome = "out_of_bounds"
     elif state.y <= GROUND_Y:
@@ -340,11 +383,15 @@ def step_environment(
         if safe_touchdown:
             landed = True
             outcome = "landed"
-            reward = 25.0 + 6.0 * state.fuel + max(0.0, 1.5 - next_cost * 3.0)
+            reward = (
+                config.reward_landing_bonus
+                + config.reward_landing_fuel_bonus * state.fuel
+                + max(0.0, config.reward_landing_precision_bonus - next_cost * config.reward_landing_precision_scale)
+            )
         else:
             outcome = "crashed" if on_pad else "missed_pad"
             impact = min(1.5, abs(state.vx) + abs(state.vy) + abs(state.angle))
-            reward = -16.0 - 6.0 * impact
+            reward = -config.reward_crash_penalty - config.reward_crash_impact_penalty * impact
 
     return StepResult(
         reward=float(reward),
@@ -416,6 +463,7 @@ def run_policy_episode(
     rng: np.random.Generator,
     record_episode: bool = False,
     deterministic: bool = False,
+    requires_grad: bool = True,
 ) -> dict[str, object]:
     if torch is None:
         raise RuntimeError("PyTorch is required for policy rollouts.")
@@ -439,17 +487,28 @@ def run_policy_episode(
     for step in range(config.episode_steps):
         step_fraction = step / max(config.episode_steps - 1, 1)
         observation = build_inputs(state, config, step_fraction)
-        tensor = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
-        mean, std, value = policy(tensor)
-        distribution = torch.distributions.Normal(mean, std)
-
-        if deterministic:
-            raw_action = mean.squeeze(0)
-            log_prob = distribution.log_prob(raw_action.unsqueeze(0)).sum(dim=-1).squeeze(0)
+        tensor = torch.from_numpy(observation).unsqueeze(0)
+        if requires_grad:
+            mean, std, value = policy(tensor)
+            distribution = torch.distributions.Normal(mean, std)
+            if deterministic:
+                raw_action = mean.squeeze(0)
+                log_prob = distribution.log_prob(raw_action.unsqueeze(0)).sum(dim=-1).squeeze(0)
+            else:
+                raw_action = distribution.rsample().squeeze(0)
+                log_prob = distribution.log_prob(raw_action.unsqueeze(0)).sum(dim=-1).squeeze(0)
+            entropy = distribution.entropy().sum(dim=-1).squeeze(0)
         else:
-            raw_action = distribution.rsample().squeeze(0)
-            log_prob = distribution.log_prob(raw_action.unsqueeze(0)).sum(dim=-1).squeeze(0)
-        entropy = distribution.entropy().sum(dim=-1).squeeze(0)
+            with torch.inference_mode():
+                mean, std, value = policy(tensor)
+                distribution = torch.distributions.Normal(mean, std)
+                if deterministic:
+                    raw_action = mean.squeeze(0)
+                    log_prob = distribution.log_prob(raw_action.unsqueeze(0)).sum(dim=-1).squeeze(0)
+                else:
+                    raw_action = distribution.sample().squeeze(0)
+                    log_prob = distribution.log_prob(raw_action.unsqueeze(0)).sum(dim=-1).squeeze(0)
+                entropy = distribution.entropy().sum(dim=-1).squeeze(0)
 
         turn_command = float(torch.tanh(raw_action[0]).item())
         throttle_request = float(torch.sigmoid(raw_action[1]).item())
@@ -460,9 +519,10 @@ def run_policy_episode(
         observations.append(observation.astype(np.float32))
         actions.append(raw_action.detach().cpu().numpy().astype(np.float32))
         old_log_probs.append(float(log_prob.item()))
-        log_probs.append(log_prob)
-        entropies.append(entropy)
-        values.append(value.squeeze(0))
+        if requires_grad:
+            log_probs.append(log_prob)
+            entropies.append(entropy)
+            values.append(value.squeeze(0))
         value_predictions.append(float(value.item()))
         step_rewards.append(float(step_result.reward))
         dones.append(bool(step_result.done))
@@ -472,9 +532,9 @@ def run_policy_episode(
             outcome = step_result.outcome or outcome
             break
     else:
-        total_reward -= 1.5
+        total_reward -= config.reward_timeout_penalty
         if step_rewards:
-            step_rewards[-1] -= 1.5
+            step_rewards[-1] -= config.reward_timeout_penalty
             dones[-1] = True
 
     return {
@@ -552,6 +612,7 @@ class GradientTrainer:
                 np.random.default_rng(seed_value),
                 record_episode=False,
                 deterministic=False,
+                requires_grad=True,
             )
             if episode["log_probs"]:
                 episodes.append(episode)
@@ -612,6 +673,7 @@ class GradientTrainer:
                 np.random.default_rng(seed_value),
                 record_episode=False,
                 deterministic=False,
+                requires_grad=False,
             )
             if not episode["observations"]:
                 continue
@@ -688,6 +750,7 @@ class GradientTrainer:
                 np.random.default_rng(seed_value),
                 record_episode=False,
                 deterministic=True,
+                requires_grad=False,
             )
             reward_values.append(float(episode["reward"]))
             landings += float(episode["landed"])
@@ -736,6 +799,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--landing-vx", type=float, default=defaults.landing_vx)
     parser.add_argument("--landing-vy", type=float, default=defaults.landing_vy)
     parser.add_argument("--landing-angle", type=float, default=defaults.landing_angle)
+    parser.add_argument("--reward-progress-scale", type=float, default=defaults.reward_progress_scale)
+    parser.add_argument("--reward-step-penalty", type=float, default=defaults.reward_step_penalty)
+    parser.add_argument("--reward-throttle-penalty", type=float, default=defaults.reward_throttle_penalty)
+    parser.add_argument("--reward-turn-penalty", type=float, default=defaults.reward_turn_penalty)
+    parser.add_argument("--reward-out-of-bounds-penalty", type=float, default=defaults.reward_out_of_bounds_penalty)
+    parser.add_argument("--reward-landing-bonus", type=float, default=defaults.reward_landing_bonus)
+    parser.add_argument("--reward-landing-fuel-bonus", type=float, default=defaults.reward_landing_fuel_bonus)
+    parser.add_argument("--reward-landing-precision-bonus", type=float, default=defaults.reward_landing_precision_bonus)
+    parser.add_argument("--reward-landing-precision-scale", type=float, default=defaults.reward_landing_precision_scale)
+    parser.add_argument("--reward-crash-penalty", type=float, default=defaults.reward_crash_penalty)
+    parser.add_argument("--reward-crash-impact-penalty", type=float, default=defaults.reward_crash_impact_penalty)
+    parser.add_argument("--reward-timeout-penalty", type=float, default=defaults.reward_timeout_penalty)
     parser.add_argument("--spawn-mode", choices=["random", "side", "centered"], default=defaults.spawn_mode)
     parser.add_argument("--spawn-randomness", choices=["standard", "dramatic"], default=defaults.spawn_randomness)
     parser.add_argument("--fps", type=int, default=defaults.fps)
@@ -774,6 +849,18 @@ def config_from_args(args: argparse.Namespace) -> DemoConfig:
         landing_vx=args.landing_vx,
         landing_vy=args.landing_vy,
         landing_angle=args.landing_angle,
+        reward_progress_scale=args.reward_progress_scale,
+        reward_step_penalty=args.reward_step_penalty,
+        reward_throttle_penalty=args.reward_throttle_penalty,
+        reward_turn_penalty=args.reward_turn_penalty,
+        reward_out_of_bounds_penalty=args.reward_out_of_bounds_penalty,
+        reward_landing_bonus=args.reward_landing_bonus,
+        reward_landing_fuel_bonus=args.reward_landing_fuel_bonus,
+        reward_landing_precision_bonus=args.reward_landing_precision_bonus,
+        reward_landing_precision_scale=args.reward_landing_precision_scale,
+        reward_crash_penalty=args.reward_crash_penalty,
+        reward_crash_impact_penalty=args.reward_crash_impact_penalty,
+        reward_timeout_penalty=args.reward_timeout_penalty,
         spawn_mode=args.spawn_mode,
         spawn_randomness=args.spawn_randomness,
         fps=args.fps,

@@ -736,17 +736,62 @@ class ForagerRaiderApp:
         self.root.rowconfigure(0, weight=1)
         panes = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         panes.grid(row=0, column=0, sticky="nsew")
-        left = ttk.Frame(panes, padding=(14, 14, 10, 14), width=330)
+        left = ttk.Frame(panes, padding=(10, 14, 6, 14), width=350)
         center = ttk.Frame(panes, padding=(8, 14, 8, 14), width=820)
         right = ttk.Frame(panes, padding=(10, 14, 14, 14), width=560)
         panes.add(left, weight=1)
         panes.add(center, weight=4)
         panes.add(right, weight=3)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
         center.columnconfigure(0, weight=1)
         center.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
-        self._build_settings_panel(left)
+
+        settings_canvas = tk.Canvas(left, bg="#edf1f3", highlightthickness=0, width=340)
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scrollbar = ttk.Scrollbar(left, orient=tk.VERTICAL, command=settings_canvas.yview)
+        settings_scrollbar.grid(row=0, column=1, sticky="ns")
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+
+        settings_inner = ttk.Frame(settings_canvas, padding=(4, 0, 8, 0))
+        settings_window = settings_canvas.create_window((0, 0), window=settings_inner, anchor="nw")
+
+        def sync_settings_scroll(_event=None) -> None:
+            settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+
+        def sync_settings_width(event) -> None:
+            settings_canvas.itemconfigure(settings_window, width=event.width)
+
+        def scroll_settings(event) -> str:
+            delta = 0
+            if hasattr(event, "delta") and event.delta:
+                delta = -1 * int(event.delta / 120) if abs(event.delta) >= 120 else (-1 if event.delta > 0 else 1)
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                settings_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        def bind_scroll_events(widget: tk.Widget) -> None:
+            widget.bind("<MouseWheel>", scroll_settings, add="+")
+            widget.bind("<Button-4>", scroll_settings, add="+")
+            widget.bind("<Button-5>", scroll_settings, add="+")
+            for child in widget.winfo_children():
+                bind_scroll_events(child)
+
+        settings_inner.bind("<Configure>", sync_settings_scroll)
+        settings_canvas.bind("<Configure>", sync_settings_width)
+        settings_canvas.bind("<MouseWheel>", scroll_settings)
+        settings_inner.bind("<MouseWheel>", scroll_settings)
+
+        self._build_settings_panel(settings_inner)
+        bind_scroll_events(settings_inner)
+        self.root.after_idle(sync_settings_scroll)
+
         ttk.Label(center, text="Arena", font=("Segoe UI Semibold", 16)).grid(row=0, column=0, sticky="w")
         self.arena_canvas = tk.Canvas(center, bg="#f6fafb", highlightthickness=0, width=760, height=760)
         self.arena_canvas.grid(row=1, column=0, sticky="nsew", pady=(8, 8))

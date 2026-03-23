@@ -2,6 +2,12 @@
 
 This folder contains several presentation-friendly Python GUIs and demos for reinforcement learning, CNN visualization, and Ultralytics YOLO26 inference.
 
+## If you are new to Python then here is a quick way around.
+
+The launch.exe will setup a runtime folder and download and configure the stand alone version of python.  Then it will run a launcher that will allow running the 4 examples.
+The first time will take a bit of time, since it is a setup effectively.  But it runs independently so no conflict issues.  
+Subsequent runs will just run the launcher while the runtime folder exists.
+
 ## Install Python With Miniconda
 
 Official Miniconda getting-started guide:
@@ -143,11 +149,11 @@ python rocket_landing_drl_gui.py
 What it does:
 
 - Provides a PPO or REINFORCE rocket-landing demo with a live replay and neural-network visualization.
-- Lets you tune spawn settings, physics, optimizer settings, and hidden-layer layout.
+- Lets you tune spawn settings, physics, optimizer settings, rewards, penalties, and hidden-layer layout.
 
 
 1. Launch the script.
-2. Adjust training, spawn, and physics settings on the left.
+2. Adjust training, spawn, physics, and reward-shaping settings on the left.
 3. Press `Start / Restart` to begin training.
 4. Watch the replay, training graph, and network panel update by generation.
 5. Use `Pause` to inspect the current learned policy.
@@ -173,6 +179,7 @@ What it does:
 - Trains a configurable CNN on handwritten digits from the MNIST dataset.
 - Shows the input digit, learned convolution kernels, feature maps, dense activations, and the fixed `0-9` output layer.
 - Lets you add or remove convolution and dense layers in the GUI.
+- Includes visualizer zoom controls plus `Fit to View` so the architecture can be scaled to the available display area.
 
 How to use it:
 

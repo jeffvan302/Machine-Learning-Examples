@@ -162,6 +162,54 @@ SETTING_TOOLTIPS = {
         "Maximum safe tilt angle at touchdown, in radians.\n\n"
         "Higher values allow the rocket to land at a larger tilt instead of needing to be nearly upright."
     ),
+    "reward_progress_scale": (
+        "Multiplier on the improvement in landing cost from one step to the next.\n\n"
+        "Higher values reward progress toward a safe landing more aggressively."
+    ),
+    "reward_step_penalty": (
+        "Small base penalty paid every simulation step.\n\n"
+        "Higher values encourage faster landings and punish drifting around for too long."
+    ),
+    "reward_throttle_penalty": (
+        "Extra penalty applied in proportion to throttle use.\n\n"
+        "Higher values encourage fuel-efficient behavior and lighter engine use."
+    ),
+    "reward_turn_penalty": (
+        "Extra penalty applied in proportion to steering effort.\n\n"
+        "Higher values discourage twitchy turning and favor smoother control."
+    ),
+    "reward_out_of_bounds_penalty": (
+        "Penalty when the rocket leaves the playable area.\n\n"
+        "Higher values strongly punish flying off-screen or escaping upward."
+    ),
+    "reward_landing_bonus": (
+        "Base reward for a successful landing.\n\n"
+        "Higher values make touchdown itself much more important relative to shaping rewards."
+    ),
+    "reward_landing_fuel_bonus": (
+        "Extra reward multiplier for fuel remaining after a successful landing.\n\n"
+        "Higher values encourage efficient descents that conserve propellant."
+    ),
+    "reward_landing_precision_bonus": (
+        "Maximum extra reward for a very clean, precise landing.\n\n"
+        "This bonus is reduced by the landing cost at touchdown."
+    ),
+    "reward_landing_precision_scale": (
+        "How strongly touchdown cost reduces the precision bonus.\n\n"
+        "Higher values make the bonus fall off faster when the landing is less tidy."
+    ),
+    "reward_crash_penalty": (
+        "Base penalty for a failed touchdown.\n\n"
+        "Higher values punish crashes and missed-pad landings more severely."
+    ),
+    "reward_crash_impact_penalty": (
+        "Extra crash penalty based on impact severity.\n\n"
+        "Higher values punish fast or badly angled impacts more strongly."
+    ),
+    "reward_timeout_penalty": (
+        "Penalty applied when an episode runs out of steps before landing.\n\n"
+        "Higher values discourage hovering or wandering until the timer expires."
+    ),
     "fps": (
         "Replay speed in frames per second.\n\n"
         "This only changes how fast the visualization plays. It does not change training."
@@ -383,6 +431,18 @@ class GuiConfig:
     landing_vx: float
     landing_vy: float
     landing_angle: float
+    reward_progress_scale: float
+    reward_step_penalty: float
+    reward_throttle_penalty: float
+    reward_turn_penalty: float
+    reward_out_of_bounds_penalty: float
+    reward_landing_bonus: float
+    reward_landing_fuel_bonus: float
+    reward_landing_precision_bonus: float
+    reward_landing_precision_scale: float
+    reward_crash_penalty: float
+    reward_crash_impact_penalty: float
+    reward_timeout_penalty: float
     spawn_mode: str
     spawn_randomness: str
     fps: int
@@ -419,6 +479,18 @@ class GuiConfig:
             landing_vx=self.landing_vx,
             landing_vy=self.landing_vy,
             landing_angle=self.landing_angle,
+            reward_progress_scale=self.reward_progress_scale,
+            reward_step_penalty=self.reward_step_penalty,
+            reward_throttle_penalty=self.reward_throttle_penalty,
+            reward_turn_penalty=self.reward_turn_penalty,
+            reward_out_of_bounds_penalty=self.reward_out_of_bounds_penalty,
+            reward_landing_bonus=self.reward_landing_bonus,
+            reward_landing_fuel_bonus=self.reward_landing_fuel_bonus,
+            reward_landing_precision_bonus=self.reward_landing_precision_bonus,
+            reward_landing_precision_scale=self.reward_landing_precision_scale,
+            reward_crash_penalty=self.reward_crash_penalty,
+            reward_crash_impact_penalty=self.reward_crash_impact_penalty,
+            reward_timeout_penalty=self.reward_timeout_penalty,
             spawn_mode=self.spawn_mode,
             spawn_randomness=self.spawn_randomness,
             fps=self.fps,
@@ -510,8 +582,8 @@ def run_visual_episode(policy, config: rocket.DemoConfig, rng: np.random.Generat
     for step in range(config.episode_steps):
         step_fraction = step / max(config.episode_steps - 1, 1)
         observation = rocket.build_inputs(state, config, step_fraction)
-        tensor = torch.tensor(observation, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
+        tensor = torch.from_numpy(observation).unsqueeze(0)
+        with torch.inference_mode():
             mean, _std, value, hidden_layers = policy_forward_with_activations(policy, tensor)
         raw_action = mean.squeeze(0)
         turn_command = float(torch.tanh(raw_action[0]).item())
@@ -546,7 +618,7 @@ def run_visual_episode(policy, config: rocket.DemoConfig, rng: np.random.Generat
             landed = step_result.landed
             break
     else:
-        reward -= 1.8
+        reward -= config.reward_timeout_penalty
 
     return VisualReplay(
         positions=np.array(positions, dtype=np.float64),
@@ -614,6 +686,7 @@ class GradientRocketTrainer:
                 episode_rng,
                 record_episode=False,
                 deterministic=False,
+                requires_grad=True,
             )
             if episode["log_probs"]:
                 batch_episodes.append(episode)
@@ -675,6 +748,7 @@ class GradientRocketTrainer:
                 episode_rng,
                 record_episode=False,
                 deterministic=False,
+                requires_grad=False,
             )
             if not episode["observations"]:
                 continue
@@ -762,6 +836,7 @@ class GradientRocketTrainer:
                     eval_rng,
                     record_episode=False,
                     deterministic=True,
+                    requires_grad=False,
                 )
                 eval_rewards.append(float(evaluation["reward"]))
                 eval_landings += float(evaluation["landed"])
@@ -832,20 +907,63 @@ class RocketLandingGuiApp:
         panes = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
         panes.grid(row=0, column=0, sticky="nsew")
 
-        left = ttk.Frame(panes, padding=(14, 14, 10, 14), width=350)
+        left = ttk.Frame(panes, padding=(10, 14, 6, 14), width=370)
         center = ttk.Frame(panes, padding=(8, 14, 8, 14), width=840)
         right = ttk.Frame(panes, padding=(10, 14, 14, 14), width=620)
         panes.add(left, weight=1)
         panes.add(center, weight=4)
         panes.add(right, weight=3)
 
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
         center.columnconfigure(0, weight=1)
         center.rowconfigure(1, weight=4)
         center.rowconfigure(2, weight=1)
         right.columnconfigure(0, weight=1)
         right.rowconfigure(1, weight=1)
 
-        self._build_settings_panel(left)
+        settings_canvas = tk.Canvas(left, bg="#edf1f3", highlightthickness=0, width=360)
+        settings_canvas.grid(row=0, column=0, sticky="nsew")
+        settings_scrollbar = ttk.Scrollbar(left, orient="vertical", command=settings_canvas.yview)
+        settings_scrollbar.grid(row=0, column=1, sticky="ns")
+        settings_canvas.configure(yscrollcommand=settings_scrollbar.set)
+
+        settings_inner = ttk.Frame(settings_canvas, padding=(4, 0, 8, 0))
+        settings_window = settings_canvas.create_window((0, 0), window=settings_inner, anchor="nw")
+
+        def sync_settings_scroll(_event=None) -> None:
+            settings_canvas.configure(scrollregion=settings_canvas.bbox("all"))
+
+        def sync_settings_width(event) -> None:
+            settings_canvas.itemconfigure(settings_window, width=event.width)
+
+        def scroll_settings(event) -> str:
+            delta = 0
+            if hasattr(event, "delta") and event.delta:
+                delta = -1 * int(event.delta / 120) if abs(event.delta) >= 120 else (-1 if event.delta > 0 else 1)
+            elif getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            if delta:
+                settings_canvas.yview_scroll(delta, "units")
+            return "break"
+
+        def bind_scroll_events(widget: tk.Widget) -> None:
+            widget.bind("<MouseWheel>", scroll_settings, add="+")
+            widget.bind("<Button-4>", scroll_settings, add="+")
+            widget.bind("<Button-5>", scroll_settings, add="+")
+            for child in widget.winfo_children():
+                bind_scroll_events(child)
+
+        settings_inner.bind("<Configure>", sync_settings_scroll)
+        settings_canvas.bind("<Configure>", sync_settings_width)
+        settings_canvas.bind("<MouseWheel>", scroll_settings)
+        settings_inner.bind("<MouseWheel>", scroll_settings)
+
+        self._build_settings_panel(settings_inner)
+        bind_scroll_events(settings_inner)
+        self.root.after_idle(sync_settings_scroll)
 
         header = ttk.Frame(center)
         header.grid(row=0, column=0, sticky="ew")
@@ -886,8 +1004,10 @@ class RocketLandingGuiApp:
         brain = ttk.LabelFrame(parent, text="Brain", padding=10)
         optimizer = ttk.LabelFrame(parent, text="Optimizer", padding=10)
         physics = ttk.LabelFrame(parent, text="Physics", padding=10)
+        rewards = ttk.LabelFrame(parent, text="Rewards", padding=10)
+        penalties = ttk.LabelFrame(parent, text="Penalties", padding=10)
         display = ttk.LabelFrame(parent, text="Display", padding=10)
-        for frame in (training, brain, optimizer, physics, display):
+        for frame in (training, brain, optimizer, physics, rewards, penalties, display):
             frame.pack(fill="x", pady=(8, 0))
 
         self._add_entry(training, "generations", "Generations")
@@ -921,6 +1041,20 @@ class RocketLandingGuiApp:
         self._add_entry(physics, "landing_vy", "Landing vy")
         self._add_entry(physics, "landing_angle", "Landing angle")
 
+        self._add_entry(rewards, "reward_progress_scale", "Progress scale")
+        self._add_entry(rewards, "reward_landing_bonus", "Landing bonus")
+        self._add_entry(rewards, "reward_landing_fuel_bonus", "Fuel bonus")
+        self._add_entry(rewards, "reward_landing_precision_bonus", "Precision bonus")
+        self._add_entry(rewards, "reward_landing_precision_scale", "Precision scale")
+
+        self._add_entry(penalties, "reward_step_penalty", "Step penalty")
+        self._add_entry(penalties, "reward_throttle_penalty", "Throttle penalty")
+        self._add_entry(penalties, "reward_turn_penalty", "Turn penalty")
+        self._add_entry(penalties, "reward_out_of_bounds_penalty", "Out-of-bounds penalty")
+        self._add_entry(penalties, "reward_crash_penalty", "Crash penalty")
+        self._add_entry(penalties, "reward_crash_impact_penalty", "Impact penalty")
+        self._add_entry(penalties, "reward_timeout_penalty", "Timeout penalty")
+
         self._add_entry(display, "fps", "Replay fps")
         button_row = ttk.Frame(parent)
         button_row.pack(fill="x", pady=(12, 0))
@@ -934,7 +1068,8 @@ class RocketLandingGuiApp:
             text=(
                 "Hover any setting label or value box for a larger detailed tooltip.\n"
                 "This GUI focuses on the deep-RL rocket trainers.\n"
-                "It starts with your PPO defaults and shows live network activations during replay."
+                "It starts with your PPO defaults and shows live network activations during replay.\n"
+                "Use the Rewards and Penalties sections to tune what the rocket is trying to achieve and what mistakes cost it."
             ),
             justify="left",
             wraplength=320,
@@ -998,6 +1133,18 @@ class RocketLandingGuiApp:
             "landing_vx": str(config.landing_vx),
             "landing_vy": str(config.landing_vy),
             "landing_angle": str(config.landing_angle),
+            "reward_progress_scale": str(config.reward_progress_scale),
+            "reward_step_penalty": str(config.reward_step_penalty),
+            "reward_throttle_penalty": str(config.reward_throttle_penalty),
+            "reward_turn_penalty": str(config.reward_turn_penalty),
+            "reward_out_of_bounds_penalty": str(config.reward_out_of_bounds_penalty),
+            "reward_landing_bonus": str(config.reward_landing_bonus),
+            "reward_landing_fuel_bonus": str(config.reward_landing_fuel_bonus),
+            "reward_landing_precision_bonus": str(config.reward_landing_precision_bonus),
+            "reward_landing_precision_scale": str(config.reward_landing_precision_scale),
+            "reward_crash_penalty": str(config.reward_crash_penalty),
+            "reward_crash_impact_penalty": str(config.reward_crash_impact_penalty),
+            "reward_timeout_penalty": str(config.reward_timeout_penalty),
             "fps": str(config.fps),
         }
         for key, value in values.items():
@@ -1031,6 +1178,18 @@ class RocketLandingGuiApp:
             landing_vx=float(self.vars["landing_vx"].get().strip()),
             landing_vy=float(self.vars["landing_vy"].get().strip()),
             landing_angle=float(self.vars["landing_angle"].get().strip()),
+            reward_progress_scale=float(self.vars["reward_progress_scale"].get().strip()),
+            reward_step_penalty=float(self.vars["reward_step_penalty"].get().strip()),
+            reward_throttle_penalty=float(self.vars["reward_throttle_penalty"].get().strip()),
+            reward_turn_penalty=float(self.vars["reward_turn_penalty"].get().strip()),
+            reward_out_of_bounds_penalty=float(self.vars["reward_out_of_bounds_penalty"].get().strip()),
+            reward_landing_bonus=float(self.vars["reward_landing_bonus"].get().strip()),
+            reward_landing_fuel_bonus=float(self.vars["reward_landing_fuel_bonus"].get().strip()),
+            reward_landing_precision_bonus=float(self.vars["reward_landing_precision_bonus"].get().strip()),
+            reward_landing_precision_scale=float(self.vars["reward_landing_precision_scale"].get().strip()),
+            reward_crash_penalty=float(self.vars["reward_crash_penalty"].get().strip()),
+            reward_crash_impact_penalty=float(self.vars["reward_crash_impact_penalty"].get().strip()),
+            reward_timeout_penalty=float(self.vars["reward_timeout_penalty"].get().strip()),
             spawn_mode=self.vars["spawn_mode"].get().strip() or "random",
             spawn_randomness=self.vars["spawn_randomness"].get().strip() or "dramatic",
             fps=int(self.vars["fps"].get().strip()),
@@ -1622,6 +1781,20 @@ def validate_gui_config(config: GuiConfig) -> None:
         raise ValueError("pad_width must be greater than 0")
     if config.landing_vx <= 0.0 or config.landing_vy <= 0.0 or config.landing_angle <= 0.0:
         raise ValueError("landing thresholds must be greater than 0")
+    if config.reward_progress_scale < 0.0:
+        raise ValueError("reward_progress_scale must be zero or greater")
+    if config.reward_step_penalty < 0.0 or config.reward_throttle_penalty < 0.0 or config.reward_turn_penalty < 0.0:
+        raise ValueError("step, throttle, and turn reward penalties must be zero or greater")
+    if config.reward_out_of_bounds_penalty < 0.0:
+        raise ValueError("reward_out_of_bounds_penalty must be zero or greater")
+    if config.reward_landing_bonus < 0.0 or config.reward_landing_fuel_bonus < 0.0:
+        raise ValueError("landing reward terms must be zero or greater")
+    if config.reward_landing_precision_bonus < 0.0 or config.reward_landing_precision_scale < 0.0:
+        raise ValueError("landing precision reward terms must be zero or greater")
+    if config.reward_crash_penalty < 0.0 or config.reward_crash_impact_penalty < 0.0:
+        raise ValueError("crash reward penalties must be zero or greater")
+    if config.reward_timeout_penalty < 0.0:
+        raise ValueError("reward_timeout_penalty must be zero or greater")
     if config.spawn_mode not in {"random", "side", "centered"}:
         raise ValueError("spawn_mode must be random, side, or centered")
     if config.spawn_randomness not in {"standard", "dramatic"}:
@@ -1631,35 +1804,48 @@ def validate_gui_config(config: GuiConfig) -> None:
 
 
 def default_config() -> GuiConfig:
+    backend_defaults = rocket.default_config()
     return GuiConfig(
-        generations=500,
-        trainer="ppo",
-        batch_episodes=20,
-        rollouts=20,
-        hidden_layers=(10, 40, 6),
-        activation="relu",
-        episode_steps=200,
-        seed=None,
-        learning_rate=0.0005,
-        weight_decay=0.00005,
-        gamma=0.985,
-        gae_lambda=0.95,
-        entropy_coef=0.0015,
-        value_coef=0.35,
-        ppo_clip=0.20,
-        ppo_epochs=6,
-        minibatch_size=128,
-        gravity=0.0098,
-        main_thrust=0.0215,
-        turn_power=0.0850,
-        fuel_burn=0.0090,
-        pad_width=0.38,
-        landing_vx=0.055,
-        landing_vy=0.060,
-        landing_angle=0.28,
-        spawn_mode="random",
-        spawn_randomness="dramatic",
-        fps=30,
+        generations=backend_defaults.generations,
+        trainer=backend_defaults.trainer,
+        batch_episodes=backend_defaults.batch_episodes,
+        rollouts=backend_defaults.rollouts,
+        hidden_layers=backend_defaults.hidden_layers,
+        activation=backend_defaults.activation,
+        episode_steps=backend_defaults.episode_steps,
+        seed=backend_defaults.seed,
+        learning_rate=backend_defaults.learning_rate,
+        weight_decay=backend_defaults.weight_decay,
+        gamma=backend_defaults.gamma,
+        gae_lambda=backend_defaults.gae_lambda,
+        entropy_coef=backend_defaults.entropy_coef,
+        value_coef=backend_defaults.value_coef,
+        ppo_clip=backend_defaults.ppo_clip,
+        ppo_epochs=backend_defaults.ppo_epochs,
+        minibatch_size=backend_defaults.minibatch_size,
+        gravity=backend_defaults.gravity,
+        main_thrust=backend_defaults.main_thrust,
+        turn_power=backend_defaults.turn_power,
+        fuel_burn=backend_defaults.fuel_burn,
+        pad_width=backend_defaults.pad_width,
+        landing_vx=backend_defaults.landing_vx,
+        landing_vy=backend_defaults.landing_vy,
+        landing_angle=backend_defaults.landing_angle,
+        reward_progress_scale=backend_defaults.reward_progress_scale,
+        reward_step_penalty=backend_defaults.reward_step_penalty,
+        reward_throttle_penalty=backend_defaults.reward_throttle_penalty,
+        reward_turn_penalty=backend_defaults.reward_turn_penalty,
+        reward_out_of_bounds_penalty=backend_defaults.reward_out_of_bounds_penalty,
+        reward_landing_bonus=backend_defaults.reward_landing_bonus,
+        reward_landing_fuel_bonus=backend_defaults.reward_landing_fuel_bonus,
+        reward_landing_precision_bonus=backend_defaults.reward_landing_precision_bonus,
+        reward_landing_precision_scale=backend_defaults.reward_landing_precision_scale,
+        reward_crash_penalty=backend_defaults.reward_crash_penalty,
+        reward_crash_impact_penalty=backend_defaults.reward_crash_impact_penalty,
+        reward_timeout_penalty=backend_defaults.reward_timeout_penalty,
+        spawn_mode=backend_defaults.spawn_mode,
+        spawn_randomness=backend_defaults.spawn_randomness,
+        fps=backend_defaults.fps,
     )
 
 
@@ -1690,6 +1876,18 @@ def config_from_args(args: argparse.Namespace) -> GuiConfig:
         landing_vx=args.landing_vx,
         landing_vy=args.landing_vy,
         landing_angle=args.landing_angle,
+        reward_progress_scale=args.reward_progress_scale,
+        reward_step_penalty=args.reward_step_penalty,
+        reward_throttle_penalty=args.reward_throttle_penalty,
+        reward_turn_penalty=args.reward_turn_penalty,
+        reward_out_of_bounds_penalty=args.reward_out_of_bounds_penalty,
+        reward_landing_bonus=args.reward_landing_bonus,
+        reward_landing_fuel_bonus=args.reward_landing_fuel_bonus,
+        reward_landing_precision_bonus=args.reward_landing_precision_bonus,
+        reward_landing_precision_scale=args.reward_landing_precision_scale,
+        reward_crash_penalty=args.reward_crash_penalty,
+        reward_crash_impact_penalty=args.reward_crash_impact_penalty,
+        reward_timeout_penalty=args.reward_timeout_penalty,
         spawn_mode=args.spawn_mode,
         spawn_randomness=args.spawn_randomness,
         fps=args.fps,
@@ -1743,6 +1941,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--landing-vx", type=float, default=defaults.landing_vx)
     parser.add_argument("--landing-vy", type=float, default=defaults.landing_vy)
     parser.add_argument("--landing-angle", type=float, default=defaults.landing_angle)
+    parser.add_argument("--reward-progress-scale", type=float, default=defaults.reward_progress_scale)
+    parser.add_argument("--reward-step-penalty", type=float, default=defaults.reward_step_penalty)
+    parser.add_argument("--reward-throttle-penalty", type=float, default=defaults.reward_throttle_penalty)
+    parser.add_argument("--reward-turn-penalty", type=float, default=defaults.reward_turn_penalty)
+    parser.add_argument("--reward-out-of-bounds-penalty", type=float, default=defaults.reward_out_of_bounds_penalty)
+    parser.add_argument("--reward-landing-bonus", type=float, default=defaults.reward_landing_bonus)
+    parser.add_argument("--reward-landing-fuel-bonus", type=float, default=defaults.reward_landing_fuel_bonus)
+    parser.add_argument("--reward-landing-precision-bonus", type=float, default=defaults.reward_landing_precision_bonus)
+    parser.add_argument("--reward-landing-precision-scale", type=float, default=defaults.reward_landing_precision_scale)
+    parser.add_argument("--reward-crash-penalty", type=float, default=defaults.reward_crash_penalty)
+    parser.add_argument("--reward-crash-impact-penalty", type=float, default=defaults.reward_crash_impact_penalty)
+    parser.add_argument("--reward-timeout-penalty", type=float, default=defaults.reward_timeout_penalty)
     parser.add_argument("--spawn-mode", choices=["random", "side", "centered"], default=defaults.spawn_mode)
     parser.add_argument("--spawn-randomness", choices=["standard", "dramatic"], default=defaults.spawn_randomness)
     parser.add_argument("--fps", type=int, default=defaults.fps)

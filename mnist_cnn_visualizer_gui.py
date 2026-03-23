@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 import queue
+import shutil
+import sys
 import threading
 import tkinter as tk
 from dataclasses import dataclass, field
@@ -81,6 +85,10 @@ SETTING_TOOLTIPS = {
         "Which test sample to inspect.\n\n"
         "When training is paused or finished, step through different test digits to see predictions."
     ),
+    "visual_zoom": (
+        "Scales the network visualizer in the main display area.\n\n"
+        "Use Fit to View to resize the whole architecture so it fits the available canvas more comfortably."
+    ),
 }
 
 
@@ -159,6 +167,63 @@ def dataset_present(data_dir: Path) -> bool:
     return True
 
 
+@contextlib.contextmanager
+def safe_download_streams():
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    fallback_stream = None
+    try:
+        if (
+            original_stdout is None
+            or original_stderr is None
+            or not hasattr(original_stdout, "write")
+            or not hasattr(original_stderr, "write")
+        ):
+            fallback_stream = open(os.devnull, "w", encoding="utf-8")
+            if original_stdout is None or not hasattr(original_stdout, "write"):
+                sys.stdout = fallback_stream
+            if original_stderr is None or not hasattr(original_stderr, "write"):
+                sys.stderr = fallback_stream
+        yield
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if fallback_stream is not None:
+            fallback_stream.close()
+
+
+def download_mnist_dataset(data_dir: Path) -> None:
+    if datasets is None:
+        raise RuntimeError("torchvision is required for MNIST support.")
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    mnist_root = data_dir / "MNIST"
+    raw_dir = mnist_root / "raw"
+    processed_dir = mnist_root / "processed"
+
+    try:
+        with safe_download_streams():
+            datasets.MNIST(root=str(data_dir), train=True, download=True)
+            datasets.MNIST(root=str(data_dir), train=False, download=True)
+        return
+    except Exception as first_exc:
+        # Interrupted or partially corrupted raw downloads can leave MNIST in a state
+        # where a clean retry is more reliable than reusing the leftover archives.
+        shutil.rmtree(raw_dir, ignore_errors=True)
+        shutil.rmtree(processed_dir, ignore_errors=True)
+        try:
+            with safe_download_streams():
+                datasets.MNIST(root=str(data_dir), train=True, download=True)
+                datasets.MNIST(root=str(data_dir), train=False, download=True)
+            return
+        except Exception as second_exc:
+            raise RuntimeError(
+                "Could not download the MNIST dataset.\n\n"
+                f"First attempt: {first_exc}\n\n"
+                f"Retry after clearing partial files: {second_exc}"
+            ) from second_exc
+
+
 def ensure_mnist_dataset(parent: tk.Misc | None, data_dir: Path, allow_prompt: bool) -> bool:
     if dataset_present(data_dir):
         return True
@@ -173,11 +238,8 @@ def ensure_mnist_dataset(parent: tk.Misc | None, data_dir: Path, allow_prompt: b
         )
     if not approved:
         return False
-    if datasets is None:
-        raise RuntimeError("torchvision is required for MNIST support.")
     try:
-        datasets.MNIST(root=str(data_dir), train=True, download=True)
-        datasets.MNIST(root=str(data_dir), train=False, download=True)
+        download_mnist_dataset(data_dir)
     except Exception as exc:  # pragma: no cover - depends on runtime/network
         if parent is not None:
             messagebox.showerror("MNIST download failed", str(exc), parent=parent)
@@ -649,6 +711,8 @@ class MnistVisualizerApp:
         self.activation_var = tk.StringVar(value=initial_config.activation)
         self.seed_var = tk.StringVar(value="" if initial_config.seed is None else str(initial_config.seed))
         self.sample_index_var = tk.StringVar(value="0")
+        self.visual_zoom_var = tk.DoubleVar(value=100.0)
+        self.zoom_label_var = tk.StringVar(value="100%")
 
         self.dataset_var = tk.StringVar(value="Dataset: checking...")
         self.progress_var = tk.StringVar(
@@ -667,7 +731,9 @@ class MnistVisualizerApp:
         self._render_layer_editors()
         self._update_dataset_status()
         self._update_button_states()
+        self._update_zoom_label()
         self._redraw_network()
+        self.root.after(180, self._fit_visualizer)
         self._poll_engine()
 
         if self.prompt_for_dataset:
@@ -684,7 +750,7 @@ class MnistVisualizerApp:
         right = ttk.Frame(panes, padding=(14, 14, 14, 12))
         panes.add(right, weight=1)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(2, weight=1)
+        right.rowconfigure(3, weight=1)
 
         header = ttk.Frame(right)
         header.grid(row=0, column=0, sticky="ew")
@@ -711,8 +777,42 @@ class MnistVisualizerApp:
 
         ttk.Separator(right, orient=tk.HORIZONTAL).grid(row=1, column=0, sticky="ew", pady=(12, 12))
 
+        viewer_controls = ttk.Frame(right)
+        viewer_controls.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        viewer_controls.columnconfigure(2, weight=1)
+
+        zoom_title = ttk.Label(viewer_controls, text="Visualizer zoom", font=("Segoe UI Semibold", 11))
+        zoom_title.grid(row=0, column=0, sticky="w")
+        self._attach_tooltip(zoom_title, SETTING_TOOLTIPS["visual_zoom"])
+
+        zoom_value = ttk.Label(viewer_controls, textvariable=self.zoom_label_var, font=("Segoe UI", 11))
+        zoom_value.grid(row=0, column=1, sticky="w", padx=(10, 10))
+        self._attach_tooltip(zoom_value, SETTING_TOOLTIPS["visual_zoom"])
+
+        zoom_slider = ttk.Scale(
+            viewer_controls,
+            from_=55.0,
+            to=185.0,
+            variable=self.visual_zoom_var,
+            command=self._on_zoom_slider,
+        )
+        zoom_slider.grid(row=0, column=2, sticky="ew", padx=(0, 10))
+        self._attach_tooltip(zoom_slider, SETTING_TOOLTIPS["visual_zoom"])
+
+        zoom_out = ttk.Button(viewer_controls, text="-", width=3, command=lambda: self._change_zoom(-10.0))
+        zoom_out.grid(row=0, column=3, padx=(0, 6))
+        self._attach_tooltip(zoom_out, SETTING_TOOLTIPS["visual_zoom"])
+
+        zoom_in = ttk.Button(viewer_controls, text="+", width=3, command=lambda: self._change_zoom(10.0))
+        zoom_in.grid(row=0, column=4, padx=(0, 6))
+        self._attach_tooltip(zoom_in, SETTING_TOOLTIPS["visual_zoom"])
+
+        fit_button = ttk.Button(viewer_controls, text="Fit to View", command=self._fit_visualizer)
+        fit_button.grid(row=0, column=5)
+        self._attach_tooltip(fit_button, SETTING_TOOLTIPS["visual_zoom"])
+
         canvas_frame = ttk.Frame(right)
-        canvas_frame.grid(row=2, column=0, sticky="nsew")
+        canvas_frame.grid(row=3, column=0, sticky="nsew")
         canvas_frame.columnconfigure(0, weight=1)
         canvas_frame.rowconfigure(0, weight=1)
 
@@ -732,6 +832,9 @@ class MnistVisualizerApp:
         y_scroll.grid(row=0, column=1, sticky="ns")
 
         self.network_canvas.bind("<Configure>", lambda _event: self._schedule_redraw_network())
+        self.network_canvas.bind("<Control-MouseWheel>", self._on_canvas_zoom)
+        self.network_canvas.bind("<Control-Button-4>", self._on_canvas_zoom)
+        self.network_canvas.bind("<Control-Button-5>", self._on_canvas_zoom)
 
         status_bar = ttk.Label(
             right,
@@ -740,7 +843,7 @@ class MnistVisualizerApp:
             anchor="w",
             foreground="#233943",
         )
-        status_bar.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        status_bar.grid(row=4, column=0, sticky="ew", pady=(10, 0))
 
     def _build_sidebar(self, parent: ttk.Frame) -> None:
         ttk.Label(
@@ -1271,6 +1374,64 @@ class MnistVisualizerApp:
             self.root.after_cancel(self.redraw_after_id)
         self.redraw_after_id = self.root.after(160, self._redraw_network)
 
+    def _zoom_scale(self) -> float:
+        return max(0.55, min(1.85, float(self.visual_zoom_var.get()) / 100.0))
+
+    def _scale(self, value: float) -> float:
+        return value * self._zoom_scale()
+
+    def _ui_font(self, size: float, *styles: str) -> tuple:
+        scaled_size = max(7, int(round(size * self._zoom_scale())))
+        return ("Segoe UI", scaled_size, *styles)
+
+    def _mono_font(self, size: float, *styles: str) -> tuple:
+        scaled_size = max(7, int(round(size * self._zoom_scale())))
+        return ("Consolas", scaled_size, *styles)
+
+    def _line_width(self, value: float) -> float:
+        return max(1.0, value * self._zoom_scale())
+
+    def _update_zoom_label(self) -> None:
+        self.zoom_label_var.set(f"{int(round(float(self.visual_zoom_var.get())))}%")
+
+    def _on_zoom_slider(self, _value=None) -> None:
+        self._update_zoom_label()
+        self._schedule_redraw_network()
+
+    def _change_zoom(self, delta_percent: float) -> None:
+        updated = max(55.0, min(185.0, float(self.visual_zoom_var.get()) + delta_percent))
+        self.visual_zoom_var.set(updated)
+        self._on_zoom_slider()
+
+    def _on_canvas_zoom(self, event) -> str:
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            self._change_zoom(10.0)
+        else:
+            self._change_zoom(-10.0)
+        return "break"
+
+    def _fit_visualizer(self) -> None:
+        self.root.update_idletasks()
+        region_text = self.network_canvas.cget("scrollregion")
+        if not region_text:
+            self._redraw_network()
+            region_text = self.network_canvas.cget("scrollregion")
+        if not region_text:
+            return
+
+        x0, y0, x1, y1 = (float(value) for value in region_text.split())
+        content_width = max(1.0, x1 - x0)
+        content_height = max(1.0, y1 - y0)
+        viewport_width = max(240.0, float(self.network_canvas.winfo_width()) - 20.0)
+        viewport_height = max(240.0, float(self.network_canvas.winfo_height()) - 20.0)
+        fit_factor = min(viewport_width / content_width, viewport_height / content_height)
+        target_zoom = max(55.0, min(185.0, float(self.visual_zoom_var.get()) * fit_factor))
+        self.visual_zoom_var.set(target_zoom)
+        self._update_zoom_label()
+        self._redraw_network()
+        self.network_canvas.xview_moveto(0.0)
+        self.network_canvas.yview_moveto(0.0)
+
     def _draw_matrix(
         self,
         canvas: tk.Canvas,
@@ -1282,7 +1443,14 @@ class MnistVisualizerApp:
         title: str | None = None,
     ) -> tuple[float, float]:
         if title:
-            canvas.create_text(x, y - 18, text=title, fill="#d8dde8", font=("Segoe UI", 11, "bold"), anchor="w")
+            canvas.create_text(
+                x,
+                y - self._scale(18.0),
+                text=title,
+                fill="#d8dde8",
+                font=self._ui_font(11, "bold"),
+                anchor="w",
+            )
         rows, cols = matrix.shape
         if palette == "kernel":
             scale = float(np.max(np.abs(matrix))) if matrix.size else 1.0
@@ -1308,47 +1476,47 @@ class MnistVisualizerApp:
                     y0 + cell,
                     fill=fill,
                     outline="#555e6f",
-                    width=1,
+                    width=self._line_width(1),
                 )
         return x + cols * cell, y + rows * cell
 
     def _draw_input_panel(self, canvas: tk.Canvas, x: float, y: float, snapshot: InspectionSnapshot | None) -> float:
-        canvas.create_text(x, y, text="Input Digit", fill="#f4f5f7", font=("Segoe UI Semibold", 16), anchor="nw")
+        canvas.create_text(x, y, text="Input Digit", fill="#f4f5f7", font=self._ui_font(16, "bold"), anchor="nw")
         canvas.create_text(
             x,
-            y + 28,
+            y + self._scale(28.0),
             text="28 x 28 grayscale test sample",
             fill="#94a3ba",
-            font=("Segoe UI", 11),
+            font=self._ui_font(11),
             anchor="nw",
         )
         matrix = np.zeros((INPUT_IMAGE_SIZE, INPUT_IMAGE_SIZE), dtype=float)
         if snapshot is not None:
             matrix = snapshot.image
-        self._draw_matrix(canvas, matrix, x, y + 60, 11, "image")
+        self._draw_matrix(canvas, matrix, x, y + self._scale(60.0), self._scale(11.0), "image")
         if snapshot is not None:
             color = "#68df83" if snapshot.prediction == snapshot.target else "#ff8a7a"
             canvas.create_text(
                 x,
-                y + 388,
+                y + self._scale(388.0),
                 text=f"Prediction {snapshot.prediction} | Target {snapshot.target}",
                 fill=color,
-                font=("Segoe UI Semibold", 14),
+                font=self._ui_font(14, "bold"),
                 anchor="nw",
             )
         else:
             canvas.create_text(
                 x,
-                y + 388,
+                y + self._scale(388.0),
                 text="Start training to inspect predictions.",
                 fill="#b6c0cf",
-                font=("Segoe UI", 13),
+                font=self._ui_font(13),
                 anchor="nw",
             )
-        return y + 430
+        return y + self._scale(430.0)
 
     def _input_panel_width(self) -> float:
-        return 336.0
+        return self._scale(336.0)
 
     def _select_feature_map(self, activations: np.ndarray | None) -> np.ndarray:
         if activations is not None and activations.size:
@@ -1357,43 +1525,47 @@ class MnistVisualizerApp:
         return np.zeros((12, 12), dtype=float)
 
     def _conv_panel_size(self, config: ConvLayerConfig, activations: np.ndarray | None) -> tuple[float, float]:
+        zoom = self._zoom_scale()
         preview_count = min(config.out_channels, 8)
         columns = 2 if preview_count > 3 else 1
         kernel_size = config.kernel_size
-        cell = max(10.0, min(22.0, 120.0 / max(kernel_size, 1)))
-        gap = 18.0
+        cell = max(10.0, min(22.0, 120.0 / max(kernel_size, 1))) * zoom
+        gap = 18.0 * zoom
         block_width = kernel_size * cell
         block_height = kernel_size * cell
         grid_rows = max(1, (preview_count + columns - 1) // columns)
         grid_width = columns * block_width + max(0, columns - 1) * gap
-        grid_height = grid_rows * block_height + max(0, grid_rows - 1) * 30.0
+        grid_height = grid_rows * block_height + max(0, grid_rows - 1) * 30.0 * zoom
 
         feature_map = self._select_feature_map(activations)
-        feature_cell = max(5.0, min(10.0, 112.0 / max(feature_map.shape[0], feature_map.shape[1])))
+        feature_cell = max(5.0, min(10.0, 112.0 / max(feature_map.shape[0], feature_map.shape[1]))) * zoom
         feature_width = feature_map.shape[1] * feature_cell
         feature_height = feature_map.shape[0] * feature_cell
 
-        panel_width = max(248.0, grid_width + 32.0, feature_width + 40.0)
-        panel_height = max(392.0, 120.0 + grid_height + 44.0 + feature_height + 50.0)
+        panel_width = max(248.0 * zoom, grid_width + 32.0 * zoom, feature_width + 40.0 * zoom)
+        panel_height = max(392.0 * zoom, 120.0 * zoom + grid_height + 44.0 * zoom + feature_height + 50.0 * zoom)
         return panel_width, panel_height
 
     def _dense_panel_width(self, config: DenseLayerConfig) -> float:
-        return 188.0 if config.units > 9 else 176.0
+        base_width = 188.0 if config.units > 9 else 176.0
+        return self._scale(base_width)
 
     def _layout_gap_and_start(self, viewport_width: float, section_widths: list[float]) -> tuple[float, float]:
-        base_gap = 28.0
-        usable_width = max(980.0, viewport_width - 88.0)
+        zoom = self._zoom_scale()
+        margin = 44.0 * zoom
+        base_gap = 28.0 * zoom
+        usable_width = max(980.0 * zoom, viewport_width - margin * 2.0)
         if len(section_widths) <= 1:
-            return base_gap, 44.0
+            return base_gap, margin
         base_content_width = sum(section_widths) + base_gap * (len(section_widths) - 1)
         if usable_width <= base_content_width:
-            return base_gap, 44.0
+            return base_gap, margin
 
         extra_space = usable_width - base_content_width
-        additional_gap = min(76.0, extra_space / max(len(section_widths) - 1, 1))
+        additional_gap = min(76.0 * zoom, extra_space / max(len(section_widths) - 1, 1))
         gap = base_gap + additional_gap
         content_width = sum(section_widths) + gap * (len(section_widths) - 1)
-        start_x = 44.0 + max(0.0, (usable_width - content_width) / 2.0)
+        start_x = margin + max(0.0, (usable_width - content_width) / 2.0)
         return gap, start_x
 
     def _draw_conv_layer(
@@ -1406,43 +1578,52 @@ class MnistVisualizerApp:
         kernels: np.ndarray | None,
         activations: np.ndarray | None,
     ) -> tuple[float, float]:
+        zoom = self._zoom_scale()
         panel_width, panel_height = self._conv_panel_size(config, activations)
-        canvas.create_rectangle(x, y, x + panel_width, y + panel_height, fill="#0d1119", outline="#2b3547", width=2)
+        canvas.create_rectangle(
+            x,
+            y,
+            x + panel_width,
+            y + panel_height,
+            fill="#0d1119",
+            outline="#2b3547",
+            width=self._line_width(2),
+        )
         canvas.create_text(
-            x + 14,
-            y + 14,
+            x + self._scale(14.0),
+            y + self._scale(14.0),
             text=f"Conv {index + 1}",
             fill="#f6f7f9",
-            font=("Segoe UI Semibold", 16),
+            font=self._ui_font(16, "bold"),
             anchor="nw",
         )
         canvas.create_text(
-            x + 14,
-            y + 44,
+            x + self._scale(14.0),
+            y + self._scale(44.0),
             text=(
                 f"{config.out_channels} kernels | size {config.kernel_size} | "
                 f"stride {config.stride} | pool {config.pool_size}"
             ),
             fill="#94a3ba",
-            font=("Segoe UI", 11),
+            font=self._ui_font(11),
             anchor="nw",
         )
 
         preview_count = min(config.out_channels, 8)
         columns = 2 if preview_count > 3 else 1
         kernel_size = config.kernel_size
-        cell = max(10.0, min(22.0, 120.0 / max(kernel_size, 1)))
-        gap = 18
+        cell = max(10.0, min(22.0, 120.0 / max(kernel_size, 1))) * zoom
+        gap = 18.0 * zoom
         block_width = kernel_size * cell
         block_height = kernel_size * cell
         grid_rows = max(1, (preview_count + columns - 1) // columns)
-        grid_height = grid_rows * block_height + max(0, grid_rows - 1) * 30.0
-        start_y = y + 82
+        grid_height = grid_rows * block_height + max(0, grid_rows - 1) * 30.0 * zoom
+        start_y = y + self._scale(82.0)
         for preview_index in range(preview_count):
             row = preview_index // columns
             col = preview_index % columns
-            kernel_x = x + 16 + col * (block_width + gap)
-            kernel_y = start_y + row * (block_height + 30)
+            kernel_x = x + self._scale(16.0) + col * (block_width + gap)
+            kernel_y = start_y + row * (block_height + self._scale(30.0))
             matrix = np.zeros((kernel_size, kernel_size), dtype=float)
             if kernels is not None and preview_index < kernels.shape[0]:
                 matrix = kernels[preview_index]
@@ -1457,35 +1638,36 @@ class MnistVisualizerApp:
             )
 
         if config.out_channels > preview_count:
+            extra_y = min(y + panel_height - self._scale(74.0), start_y + grid_height + self._scale(6.0))
             canvas.create_text(
-                x + 16,
-                y + 316,
+                x + self._scale(16.0),
+                extra_y,
                 text=f"+ {config.out_channels - preview_count} more kernels",
                 fill="#7f90ac",
-                font=("Segoe UI", 10),
+                font=self._ui_font(10),
                 anchor="nw",
             )
 
         act_matrix = self._select_feature_map(activations)
-        feature_cell = max(5.0, min(10.0, 112.0 / max(act_matrix.shape[0], act_matrix.shape[1])))
+        feature_cell = max(5.0, min(10.0, 112.0 / max(act_matrix.shape[0], act_matrix.shape[1]))) * zoom
         feature_width = act_matrix.shape[1] * feature_cell
-        feature_x = x + max(16.0, (panel_width - feature_width) / 2.0)
-        feature_y = start_y + grid_height + 44.0
+        feature_x = x + max(self._scale(16.0), (panel_width - feature_width) / 2.0)
+        feature_y = start_y + grid_height + self._scale(44.0)
         canvas.create_text(
-            x + 16,
-            feature_y - 26,
+            x + self._scale(16.0),
+            feature_y - self._scale(26.0),
             text="Feature Map",
             fill="#d7e0ed",
-            font=("Segoe UI Semibold", 12),
+            font=self._ui_font(12, "bold"),
             anchor="nw",
         )
         self._draw_matrix(canvas, act_matrix, feature_x, feature_y, feature_cell, "activation")
         canvas.create_text(
-            x + 16,
-            feature_y + act_matrix.shape[0] * feature_cell + 12,
+            x + self._scale(16.0),
+            feature_y + act_matrix.shape[0] * feature_cell + self._scale(12.0),
             text=f"response size {act_matrix.shape[1]} x {act_matrix.shape[0]}",
             fill="#7f90ac",
-            font=("Segoe UI", 10),
+            font=self._ui_font(10),
             anchor="nw",
         )
         return x + panel_width, y + panel_height
@@ -1499,62 +1681,71 @@ class MnistVisualizerApp:
         config: DenseLayerConfig,
         activations: np.ndarray | None,
     ) -> tuple[float, float]:
+        zoom = self._zoom_scale()
         visible = min(config.units, 12)
-        spacing = 28
-        radius = 11
-        column_height = max(visible * spacing + 40, 340)
+        spacing = self._scale(28.0)
+        radius = self._scale(11.0)
+        column_height = max(visible * spacing + self._scale(40.0), self._scale(340.0))
         panel_width = self._dense_panel_width(config)
-        canvas.create_rectangle(x, y, x + panel_width, y + column_height, fill="#0d1119", outline="#2b3547", width=2)
+        canvas.create_rectangle(
+            x,
+            y,
+            x + panel_width,
+            y + column_height,
+            fill="#0d1119",
+            outline="#2b3547",
+            width=self._line_width(2),
+        )
         canvas.create_text(
-            x + 14,
-            y + 14,
+            x + self._scale(14.0),
+            y + self._scale(14.0),
             text=f"Dense {index + 1}",
             fill="#f6f7f9",
-            font=("Segoe UI Semibold", 16),
+            font=self._ui_font(16, "bold"),
             anchor="nw",
         )
         canvas.create_text(
-            x + 14,
-            y + 42,
+            x + self._scale(14.0),
+            y + self._scale(42.0),
             text=f"{config.units} neurons",
             fill="#94a3ba",
-            font=("Segoe UI", 11),
+            font=self._ui_font(11),
             anchor="nw",
         )
         values = np.zeros(visible, dtype=float)
         if activations is not None and activations.size:
             values = activations[:visible]
         scale = float(np.max(np.abs(values))) if values.size else 1.0
-        start_y = y + 76
+        start_y = y + self._scale(76.0)
         for node_index in range(visible):
             value = float(values[node_index]) if node_index < values.shape[0] else 0.0
             intensity = 0.0 if scale <= 1e-8 else min(1.0, abs(value) / scale)
             fill = blend_color("#16212f", "#67d8ff" if value >= 0.0 else "#4c86ff", intensity)
             cy = start_y + node_index * spacing
             canvas.create_oval(
-                x + 22,
+                x + self._scale(22.0),
                 cy,
-                x + 22 + radius * 2,
+                x + self._scale(22.0) + radius * 2,
                 cy + radius * 2,
                 fill=fill,
                 outline="#dce4ef",
-                width=1.5,
+                width=self._line_width(1.5),
             )
             canvas.create_text(
-                x + 56,
+                x + self._scale(56.0),
                 cy + radius,
                 text=f"{value:+.2f}",
                 fill="#e8edf6",
-                font=("Consolas", 10),
+                font=self._mono_font(10),
                 anchor="w",
             )
         if config.units > visible:
             canvas.create_text(
-                x + 14,
-                y + column_height - 24,
+                x + self._scale(14.0),
+                y + column_height - self._scale(24.0),
                 text=f"+ {config.units - visible} more neurons",
                 fill="#7f90ac",
-                font=("Segoe UI", 10),
+                font=self._ui_font(10),
                 anchor="nw",
             )
         return x + panel_width, y + column_height
@@ -1566,23 +1757,31 @@ class MnistVisualizerApp:
         y: float,
         snapshot: InspectionSnapshot | None,
     ) -> tuple[float, float]:
-        panel_width = 260
-        panel_height = 430
-        canvas.create_rectangle(x, y, x + panel_width, y + panel_height, fill="#0d1119", outline="#2b3547", width=2)
+        panel_width = self._scale(260.0)
+        panel_height = self._scale(430.0)
+        canvas.create_rectangle(
+            x,
+            y,
+            x + panel_width,
+            y + panel_height,
+            fill="#0d1119",
+            outline="#2b3547",
+            width=self._line_width(2),
+        )
         canvas.create_text(
-            x + 14,
-            y + 14,
+            x + self._scale(14.0),
+            y + self._scale(14.0),
             text="Output Digits",
             fill="#f6f7f9",
-            font=("Segoe UI Semibold", 16),
+            font=self._ui_font(16, "bold"),
             anchor="nw",
         )
         canvas.create_text(
-            x + 14,
-            y + 42,
+            x + self._scale(14.0),
+            y + self._scale(42.0),
             text="Fixed 10-way classifier",
             fill="#94a3ba",
-            font=("Segoe UI", 11),
+            font=self._ui_font(11),
             anchor="nw",
         )
 
@@ -1593,90 +1792,101 @@ class MnistVisualizerApp:
             probabilities = snapshot.probabilities
             target = snapshot.target
             prediction = snapshot.prediction
-        bar_x = x + 24
-        base_y = y + 350
+        bar_x = x + self._scale(24.0)
+        base_y = y + self._scale(350.0)
+        bar_spacing = self._scale(22.0)
+        bar_width = self._scale(16.0)
+        bar_height_scale = self._scale(250.0)
         for digit in range(OUTPUT_CLASSES):
-            bar_height = 250.0 * float(probabilities[digit])
+            bar_height = bar_height_scale * float(probabilities[digit])
             fill = "#49d971" if prediction == digit and prediction == target else "#ff8a7a" if prediction == digit else "#4c86ff"
             canvas.create_rectangle(
-                bar_x + digit * 22,
+                bar_x + digit * bar_spacing,
                 base_y - bar_height,
-                bar_x + digit * 22 + 16,
+                bar_x + digit * bar_spacing + bar_width,
                 base_y,
                 fill=fill,
                 outline="",
             )
             canvas.create_text(
-                bar_x + digit * 22 + 8,
-                base_y + 18,
+                bar_x + digit * bar_spacing + bar_width * 0.5,
+                base_y + self._scale(18.0),
                 text=str(digit),
                 fill="#dde5f1",
-                font=("Segoe UI", 10, "bold"),
+                font=self._ui_font(10, "bold"),
             )
             canvas.create_text(
-                bar_x + digit * 22 + 8,
-                base_y - bar_height - 12,
+                bar_x + digit * bar_spacing + bar_width * 0.5,
+                base_y - bar_height - self._scale(12.0),
                 text=f"{probabilities[digit] * 100.0:.0f}",
                 fill="#c7d3e3",
-                font=("Segoe UI", 8),
+                font=self._ui_font(8),
             )
         if snapshot is not None:
             color = "#68df83" if prediction == target else "#ff8a7a"
             canvas.create_text(
-                x + 14,
-                y + 382,
+                x + self._scale(14.0),
+                y + self._scale(382.0),
                 text=f"Predicted {prediction} | Target {target}",
                 fill=color,
-                font=("Segoe UI Semibold", 14),
+                font=self._ui_font(14, "bold"),
                 anchor="nw",
             )
         else:
             canvas.create_text(
-                x + 14,
-                y + 382,
+                x + self._scale(14.0),
+                y + self._scale(382.0),
                 text="Prediction bars appear after the model is initialized.",
                 fill="#b6c0cf",
-                font=("Segoe UI", 12),
+                font=self._ui_font(12),
                 anchor="nw",
             )
         return x + panel_width, y + panel_height
 
     def _draw_metric_chart(self, canvas: tk.Canvas, x: float, y: float, width: float) -> float:
-        chart_height = 210
-        canvas.create_rectangle(x, y, x + width, y + chart_height, fill="#0d1119", outline="#2b3547", width=2)
+        chart_height = self._scale(210.0)
+        canvas.create_rectangle(
+            x,
+            y,
+            x + width,
+            y + chart_height,
+            fill="#0d1119",
+            outline="#2b3547",
+            width=self._line_width(2),
+        )
         canvas.create_text(
-            x + 14,
-            y + 14,
+            x + self._scale(14.0),
+            y + self._scale(14.0),
             text="Training Progress",
             fill="#f6f7f9",
-            font=("Segoe UI Semibold", 16),
+            font=self._ui_font(16, "bold"),
             anchor="nw",
         )
         if not self.metric_history:
             canvas.create_text(
-                x + 14,
-                y + 50,
+                x + self._scale(14.0),
+                y + self._scale(50.0),
                 text="Epoch summaries appear here as training completes each epoch.",
                 fill="#a3afc0",
-                font=("Segoe UI", 12),
+                font=self._ui_font(12),
                 anchor="nw",
             )
             return y + chart_height
 
-        left = x + 54
-        top = y + 44
-        right = x + width - 16
-        bottom = y + chart_height - 34
-        canvas.create_rectangle(left, top, right, bottom, outline="#556274", width=1)
+        left = x + self._scale(54.0)
+        top = y + self._scale(44.0)
+        right = x + width - self._scale(16.0)
+        bottom = y + chart_height - self._scale(34.0)
+        canvas.create_rectangle(left, top, right, bottom, outline="#556274", width=self._line_width(1))
         for tick in range(6):
             line_y = top + (bottom - top) * tick / 5.0
             canvas.create_line(left, line_y, right, line_y, fill="#1f2937")
             canvas.create_text(
-                left - 10,
+                left - self._scale(10.0),
                 line_y,
                 text=f"{100 - tick * 20}",
                 fill="#93a4ba",
-                font=("Segoe UI", 9),
+                font=self._ui_font(9),
                 anchor="e",
             )
 
@@ -1695,44 +1905,81 @@ class MnistVisualizerApp:
                 y_pos = bottom - (bottom - top) * max(0.0, min(100.0, value)) / 100.0
                 points.extend([x_pos, y_pos])
             if len(points) >= 4:
-                canvas.create_line(*points, fill=color, width=3, smooth=True)
+                canvas.create_line(*points, fill=color, width=self._line_width(3), smooth=True)
 
         draw_series(train_acc, "#49d9ff")
         draw_series(test_acc, "#49d971")
 
-        canvas.create_line(x + 22, y + 182, x + 46, y + 182, fill="#49d9ff", width=3)
-        canvas.create_text(x + 52, y + 182, text="Train accuracy", fill="#d9e2ef", font=("Segoe UI", 10), anchor="w")
-        canvas.create_line(x + 166, y + 182, x + 190, y + 182, fill="#49d971", width=3)
-        canvas.create_text(x + 196, y + 182, text="Test accuracy", fill="#d9e2ef", font=("Segoe UI", 10), anchor="w")
+        legend_y = y + self._scale(182.0)
+        canvas.create_line(
+            x + self._scale(22.0),
+            legend_y,
+            x + self._scale(46.0),
+            legend_y,
+            fill="#49d9ff",
+            width=self._line_width(3),
+        )
+        canvas.create_text(
+            x + self._scale(52.0),
+            legend_y,
+            text="Train accuracy",
+            fill="#d9e2ef",
+            font=self._ui_font(10),
+            anchor="w",
+        )
+        canvas.create_line(
+            x + self._scale(166.0),
+            legend_y,
+            x + self._scale(190.0),
+            legend_y,
+            fill="#49d971",
+            width=self._line_width(3),
+        )
+        canvas.create_text(
+            x + self._scale(196.0),
+            legend_y,
+            text="Test accuracy",
+            fill="#d9e2ef",
+            font=self._ui_font(10),
+            anchor="w",
+        )
         return y + chart_height
 
     def _redraw_network(self) -> None:
         self.redraw_after_id = None
         canvas = self.network_canvas
         canvas.delete("all")
-        viewport_width = max(float(canvas.winfo_width()), 1200.0)
-        canvas.create_rectangle(0, 0, max(2400.0, viewport_width + 400.0), 1800, fill="#05070b", outline="")
+        viewport_width = max(float(canvas.winfo_width()), 760.0)
+        viewport_height = max(float(canvas.winfo_height()), 560.0)
+        canvas.create_rectangle(
+            0,
+            0,
+            max(viewport_width + self._scale(600.0), self._scale(1800.0)),
+            max(viewport_height + self._scale(500.0), self._scale(1400.0)),
+            fill="#05070b",
+            outline="",
+        )
 
         active_config = self._active_visual_config()
         if active_config is None:
             canvas.create_text(
-                50,
-                60,
+                self._scale(50.0),
+                self._scale(60.0),
                 text="Enter valid layer settings to preview the network.",
                 fill="#e6ebf2",
-                font=("Segoe UI Semibold", 20),
+                font=self._ui_font(20, "bold"),
                 anchor="nw",
             )
-            canvas.configure(scrollregion=(0, 0, 1200, 900))
+            canvas.configure(scrollregion=(0, 0, max(viewport_width, self._scale(1200.0)), max(viewport_height, self._scale(900.0))))
             return
 
         snapshot = self.current_snapshot
         canvas.create_text(
-            44,
-            26,
+            self._scale(44.0),
+            self._scale(26.0),
             text="Yellow weights are positive, blue weights are negative. Bright activations show strong responses.",
             fill="#d9e0ee",
-            font=("Segoe UI", 12),
+            font=self._ui_font(12),
             anchor="nw",
         )
 
@@ -1746,10 +1993,10 @@ class MnistVisualizerApp:
             section_widths.append(54.0)
         for layer in active_config.dense_layers:
             section_widths.append(self._dense_panel_width(layer))
-        section_widths.append(260.0)
+        section_widths.append(self._scale(260.0))
 
         gap, x = self._layout_gap_and_start(viewport_width, section_widths)
-        top_y = 70
+        top_y = self._scale(70.0)
         lower_bound = self._draw_input_panel(canvas, x, top_y, snapshot)
         x += self._input_panel_width() + gap
 
@@ -1768,30 +2015,30 @@ class MnistVisualizerApp:
 
         if active_config.conv_layers:
             canvas.create_text(
-                x + 8,
-                top_y + 160,
+                x + self._scale(8.0),
+                top_y + self._scale(160.0),
                 text="Flatten",
                 fill="#d9e0ee",
-                font=("Segoe UI Semibold", 14),
+                font=self._ui_font(14, "bold"),
                 anchor="nw",
             )
             canvas.create_rectangle(
-                x + 12,
-                top_y + 192,
-                x + 40,
-                top_y + 242,
+                x + self._scale(12.0),
+                top_y + self._scale(192.0),
+                x + self._scale(40.0),
+                top_y + self._scale(242.0),
                 fill="#14342d",
                 outline="#59c49f",
-                width=2,
+                width=self._line_width(2),
             )
-            x += 54.0 + gap
+            x += self._scale(54.0) + gap
 
         dense_bottom = top_y
         for index, layer in enumerate(active_config.dense_layers):
             activations = None
             if snapshot is not None and index < len(snapshot.dense_activations):
                 activations = snapshot.dense_activations[index]
-            x, layer_bottom = self._draw_dense_layer(canvas, x, top_y + 8, index, layer, activations)
+            x, layer_bottom = self._draw_dense_layer(canvas, x, top_y + self._scale(8.0), index, layer, activations)
             dense_bottom = max(dense_bottom, layer_bottom)
             if index < len(active_config.dense_layers) - 1:
                 x += gap
@@ -1802,26 +2049,27 @@ class MnistVisualizerApp:
         output_x = x
         _, output_bottom = self._draw_output_layer(canvas, output_x, top_y, snapshot)
 
-        chart_top = max(conv_bottom, dense_bottom, output_bottom) + 28
-        content_right = output_x + 260.0
-        chart_width = max(content_right - 44.0, viewport_width - 88.0)
-        chart_bottom = self._draw_metric_chart(canvas, 44, chart_top, chart_width)
+        chart_top = max(conv_bottom, dense_bottom, output_bottom) + self._scale(28.0)
+        content_right = output_x + self._scale(260.0)
+        chart_left = self._scale(44.0)
+        chart_width = max(content_right - chart_left, viewport_width - self._scale(88.0))
+        chart_bottom = self._draw_metric_chart(canvas, chart_left, chart_top, chart_width)
 
         if snapshot is None:
             canvas.create_text(
-                44,
-                chart_bottom + 26,
+                self._scale(44.0),
+                chart_bottom + self._scale(26.0),
                 text=(
                     "The right panel is already showing the architecture. "
                     "Press Start / Restart to initialize weights and begin MNIST training."
                 ),
                 fill="#b9c6d8",
-                font=("Segoe UI", 13),
+                font=self._ui_font(13),
                 anchor="nw",
             )
 
-        scroll_width = max(content_right + 44.0, viewport_width)
-        scroll_height = max(chart_bottom + 90, 900)
+        scroll_width = max(content_right + self._scale(44.0), viewport_width)
+        scroll_height = max(chart_bottom + self._scale(90.0), viewport_height)
         canvas.configure(scrollregion=(0, 0, scroll_width, scroll_height))
 
     def _on_close(self) -> None:
