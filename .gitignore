@@ -1,5 +1,5 @@
 runtime/
 ultralytics_runtime/
-.pt
+*.pt
 mnist_data/
 __pycache__/
