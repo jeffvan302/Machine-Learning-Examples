@@ -8,9 +8,10 @@ The launch.exe will setup a runtime folder and download and configure the stand 
 The first time will take a bit of time, since it is a setup effectively.  But it runs independently so no conflict issues.  
 Subsequent runs will just run the launcher while the runtime folder exists.
 
-## If you want to try your hand and Vibe Coding in python using LLM then try the following example:
-[my_own_rocket_lander_RL.md](/my_own_rocket_lander_RL.md)
-]
+## Vibe Coding your own rocket game with learning ability
+The details of such a project is captured in the requirements listed in the [rocket_project_requirements.md](rocket_project_requirements.md)
+If you provide the requirements document to a coding LLM then it should code a similar "game" trainer.
+
 ## Install Python With Miniconda
 
 Official Miniconda getting-started guide:
