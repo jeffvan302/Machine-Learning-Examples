@@ -9,7 +9,7 @@ The first time will take a bit of time, since it is a setup effectively.  But it
 Subsequent runs will just run the launcher while the runtime folder exists.
 
 ## Vibe Coding your own rocket game with learning ability
-The details of such a project is captured in the requirements listed in the [rocket_project_requirements.md](rocket_project_requirements.md)
+You can see the Vibe Coding with project requirements at this repository: [https://github.com/jeffvan302/ml_rocket_lander](https://github.com/jeffvan302/ml_rocket_lander).
 If you provide the requirements document to a coding LLM then it should code a similar "game" trainer.
 
 ## Install Python With Miniconda
