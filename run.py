@@ -112,6 +112,90 @@ def _project_has_local_changes(project: ManagedProject, git_executable: str) -> 
     return status_result.returncode == 0 and bool(status_result.stdout.strip())
 
 
+def _project_local_changes(
+    project: ManagedProject,
+    git_executable: str,
+) -> list[tuple[str, str]]:
+    status_result = subprocess.run(
+        [git_executable, "-C", str(project.install_dir), "status", "--porcelain"],
+        cwd=str(WORKSPACE_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if status_result.returncode != 0:
+        return []
+
+    changes: list[tuple[str, str]] = []
+    for raw_line in status_result.stdout.splitlines():
+        if len(raw_line) < 4:
+            continue
+        status = raw_line[:2]
+        path = raw_line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path:
+            changes.append((status, path))
+    return changes
+
+
+def _is_transient_python_artifact(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized.endswith(".pyc") or "/__pycache__/" in f"/{normalized}"
+
+
+def _discard_transient_project_changes(
+    project: ManagedProject,
+    git_executable: str,
+    changes: list[tuple[str, str]],
+) -> None:
+    transient_changes = [
+        (status, path)
+        for status, path in changes
+        if _is_transient_python_artifact(path)
+    ]
+    if not transient_changes:
+        return
+
+    tracked_paths = [path for status, path in transient_changes if status != "??"]
+    untracked_paths = [path for status, path in transient_changes if status == "??"]
+
+    if tracked_paths:
+        restore_result = subprocess.run(
+            [
+                git_executable,
+                "-C",
+                str(project.install_dir),
+                "restore",
+                "--staged",
+                "--worktree",
+                "--",
+                *tracked_paths,
+            ],
+            cwd=str(WORKSPACE_DIR),
+            capture_output=True,
+            text=True,
+        )
+        if restore_result.returncode != 0:
+            error_output = (
+                restore_result.stderr.strip()
+                or restore_result.stdout.strip()
+                or "git restore failed."
+            )
+            raise RuntimeError(
+                f"Could not clean generated Python cache files before updating {project.display_name}.\n\n"
+                f"{error_output}"
+            )
+
+    for relative_path in untracked_paths:
+        target = project.install_dir / Path(relative_path)
+        if not target.exists():
+            continue
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+
+
 def ensure_external_project(project: ManagedProject) -> Path:
     if project.run_path.exists():
         return project.run_path
@@ -165,10 +249,22 @@ def update_external_project(project: ManagedProject) -> str:
     git_executable = shutil.which("git")
     has_git_checkout = (project.install_dir / ".git").exists()
     if git_executable and has_git_checkout:
-        if _project_has_local_changes(project, git_executable):
+        changes = _project_local_changes(project, git_executable)
+        if changes:
+            _discard_transient_project_changes(project, git_executable, changes)
+            changes = _project_local_changes(project, git_executable)
+
+        if changes:
+            display_paths = "\n".join(
+                f"- {path}"
+                for _status, path in changes[:8]
+            )
+            if len(changes) > 8:
+                display_paths += "\n- ..."
             raise RuntimeError(
                 f"{project.display_name} has local changes in {project.relative_install_dir}, so the launcher "
-                "will not auto-update it. Commit, stash, or remove those changes first."
+                "will not auto-update it. Commit, stash, or remove those changes first.\n\n"
+                f"Blocking files:\n{display_paths}"
             )
 
         old_head_result = subprocess.run(
