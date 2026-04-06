@@ -1,11 +1,11 @@
 # Core numerical array support
-numpy
+numpy>=1.26
 
 # Video I/O for the Ultralytics demo
 opencv-python
 
 # Deep learning runtime used by both GUIs
-torch
+numpy>=1.26
 torchvision
 ultralytics
 
