@@ -14,6 +14,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
+from torch_device_utils import available_device_choices, resolve_torch_device
+
 RUNTIME_DIR = Path(__file__).resolve().with_name("ultralytics_runtime")
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("YOLO_CONFIG_DIR", str(RUNTIME_DIR))
@@ -99,8 +101,18 @@ class YoloVideoWorker:
     def _emit(self, kind: str, payload: object) -> None:
         self.queue.put((kind, payload))
 
-    def _resolve_device(self) -> str | None:
-        return None if self.config.device == "auto" else self.config.device
+    def _resolve_device(self):
+        return resolve_torch_device(self.config.device)
+
+    def _predict_frame(self, model: YOLO, frame_bgr: np.ndarray, device_name: str):
+        return model.predict(
+            source=frame_bgr,
+            conf=self.config.conf,
+            iou=self.config.iou,
+            imgsz=self.config.imgsz,
+            device=device_name,
+            verbose=False,
+        )
 
     def _collect_counts(self, result) -> tuple[int, dict[str, float]]:
         counts: dict[str, float] = {}
@@ -153,7 +165,10 @@ class YoloVideoWorker:
             total_frames = 0 if self.config.source_type == "camera" else int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             device = self._resolve_device()
 
-            self._emit("status", f"Running {self.config.task} inference on {source_name}")
+            status_message = f"Running {self.config.task} inference on {source_name} with {device.label}"
+            if device.reason:
+                status_message = f"{device.reason} {status_message}"
+            self._emit("status", status_message)
             frame_index = 0
             frame_interval = 1.0 / max(fps, 1.0)
 
@@ -169,14 +184,17 @@ class YoloVideoWorker:
 
                 frame_index += 1
                 infer_start = time.perf_counter()
-                results = model.predict(
-                    source=frame_bgr,
-                    conf=self.config.conf,
-                    iou=self.config.iou,
-                    imgsz=self.config.imgsz,
-                    device=device,
-                    verbose=False,
-                )
+                try:
+                    results = self._predict_frame(model, frame_bgr, device.runtime_device)
+                except Exception as exc:
+                    if not device.is_gpu:
+                        raise
+                    fallback_message = (
+                        f"{device.label} inference failed, so the demo is retrying on CPU.\n\nDetails: {exc}"
+                    )
+                    self._emit("status", fallback_message)
+                    device = resolve_torch_device("cpu")
+                    results = self._predict_frame(model, frame_bgr, device.runtime_device)
                 inference_ms = (time.perf_counter() - infer_start) * 1000.0
 
                 result = results[0]
@@ -302,7 +320,7 @@ class YoloVideoDemoApp:
         self._labeled_entry(settings, "Confidence", self.conf_var)
         self._labeled_entry(settings, "IoU", self.iou_var)
         self._labeled_entry(settings, "Image size", self.imgsz_var)
-        self._labeled_combo(settings, "Device", self.device_var, ("auto", "cpu"))
+        self._labeled_combo(settings, "Device", self.device_var, available_device_choices())
 
         ttk.Label(
             settings,

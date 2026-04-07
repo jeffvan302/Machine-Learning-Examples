@@ -127,7 +127,7 @@ What it does:
 3. Wait for the first-run download to finish if the subfolder has not been installed yet.
 4. Use the upstream rocket project's GUI as normal.
 
-The `Update` button on that card will refresh the installed copy later. When the folder is a git clone, the launcher uses `git pull --ff-only`. Otherwise it replaces the folder with the latest GitHub archive snapshot.
+The `Update` button on that card will replace the local external copy with a fresh upstream version. Any local edits inside `external/ml_rocket_lander` are overwritten by design.
 
 Once installed, you can also run the upstream project directly:
 
@@ -156,7 +156,7 @@ What it does:
 3. Wait for the first-run download to finish if the subfolder has not been installed yet.
 4. Use the upstream car-driver project's GUI as normal.
 
-The `Update` button on that card will refresh the installed copy later. When the folder is a git clone, the launcher uses `git pull --ff-only`. Otherwise it replaces the folder with the latest GitHub archive snapshot.
+The `Update` button on that card will replace the local external copy with a fresh upstream version. Any local edits inside `external/ml-car-driver` are overwritten by design.
 
 Once installed, you can also run the upstream project directly:
 

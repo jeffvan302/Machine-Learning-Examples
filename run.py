@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 import shutil
 import subprocess
 import sys
@@ -63,11 +65,19 @@ CAR_PROJECT = ManagedProject(
 )
 
 
+def _handle_remove_readonly(func: Callable[..., object], path: str, exc_info: object) -> None:
+    _exc_type, exc, _traceback = exc_info
+    if not isinstance(exc, PermissionError):
+        raise exc
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def _clear_install_target(target_dir: Path) -> None:
     if not target_dir.exists():
         return
     if target_dir.is_dir():
-        shutil.rmtree(target_dir)
+        shutil.rmtree(target_dir, onerror=_handle_remove_readonly)
         return
     target_dir.unlink()
 
@@ -88,14 +98,66 @@ def _download_project_archive(project: ManagedProject, target_dir: Path) -> None
         shutil.move(str(extracted_dir), str(target_dir))
 
 
-def _replace_project_from_archive(project: ManagedProject) -> None:
+def _git_head(target_dir: Path, git_executable: str) -> str | None:
+    head_result = subprocess.run(
+        [git_executable, "-C", str(target_dir), "rev-parse", "HEAD"],
+        cwd=str(WORKSPACE_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if head_result.returncode != 0:
+        return None
+    return head_result.stdout.strip() or None
+
+
+def _install_project_into_dir(project: ManagedProject, target_dir: Path) -> str | None:
+    errors: list[str] = []
+    git_executable = shutil.which("git")
+
+    _clear_install_target(target_dir)
+    if git_executable:
+        clone_result = subprocess.run(
+            [git_executable, "clone", "--depth", "1", project.repo_url, str(target_dir)],
+            cwd=str(WORKSPACE_DIR),
+            capture_output=True,
+            text=True,
+        )
+        if clone_result.returncode == 0 and (target_dir / project.entry_script).exists():
+            return _git_head(target_dir, git_executable)
+        _clear_install_target(target_dir)
+        error_output = clone_result.stderr.strip() or clone_result.stdout.strip() or "git clone failed."
+        errors.append(f"git clone: {error_output}")
+    else:
+        errors.append("git clone: Git is not installed or not on PATH.")
+
+    try:
+        _download_project_archive(project, target_dir)
+    except Exception as exc:
+        _clear_install_target(target_dir)
+        errors.append(f"zip download: {exc}")
+    else:
+        if (target_dir / project.entry_script).exists():
+            return None
+        _clear_install_target(target_dir)
+        errors.append(
+            f"zip download: install completed but {project.entry_script} was missing afterwards."
+        )
+
+    details = "\n\n".join(errors)
+    raise RuntimeError(
+        f"Could not download the {project.display_name} project from {project.repo_url}.\n\n"
+        f"{details}"
+    )
+
+
+def _replace_project_with_latest(project: ManagedProject) -> str | None:
     EXTERNAL_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     replacement_dir = EXTERNAL_PROJECTS_DIR / f".{project.install_dir.name}_update"
     backup_dir = EXTERNAL_PROJECTS_DIR / f".{project.install_dir.name}_backup"
 
     _clear_install_target(replacement_dir)
     _clear_install_target(backup_dir)
-    _download_project_archive(project, replacement_dir)
+    installed_commit = _install_project_into_dir(project, replacement_dir)
 
     try:
         if project.install_dir.exists():
@@ -109,99 +171,7 @@ def _replace_project_from_archive(project: ManagedProject) -> None:
         _clear_install_target(replacement_dir)
         _clear_install_target(backup_dir)
 
-
-def _project_has_local_changes(project: ManagedProject, git_executable: str) -> bool:
-    status_result = subprocess.run(
-        [git_executable, "-C", str(project.install_dir), "status", "--porcelain"],
-        cwd=str(WORKSPACE_DIR),
-        capture_output=True,
-        text=True,
-    )
-    return status_result.returncode == 0 and bool(status_result.stdout.strip())
-
-
-def _project_local_changes(
-    project: ManagedProject,
-    git_executable: str,
-) -> list[tuple[str, str]]:
-    status_result = subprocess.run(
-        [git_executable, "-C", str(project.install_dir), "status", "--porcelain"],
-        cwd=str(WORKSPACE_DIR),
-        capture_output=True,
-        text=True,
-    )
-    if status_result.returncode != 0:
-        return []
-
-    changes: list[tuple[str, str]] = []
-    for raw_line in status_result.stdout.splitlines():
-        if len(raw_line) < 4:
-            continue
-        status = raw_line[:2]
-        path = raw_line[3:].strip()
-        if " -> " in path:
-            path = path.split(" -> ", 1)[1].strip()
-        if path:
-            changes.append((status, path))
-    return changes
-
-
-def _is_transient_python_artifact(path: str) -> bool:
-    normalized = path.replace("\\", "/")
-    return normalized.endswith(".pyc") or "/__pycache__/" in f"/{normalized}"
-
-
-def _discard_transient_project_changes(
-    project: ManagedProject,
-    git_executable: str,
-    changes: list[tuple[str, str]],
-) -> None:
-    transient_changes = [
-        (status, path)
-        for status, path in changes
-        if _is_transient_python_artifact(path)
-    ]
-    if not transient_changes:
-        return
-
-    tracked_paths = [path for status, path in transient_changes if status != "??"]
-    untracked_paths = [path for status, path in transient_changes if status == "??"]
-
-    if tracked_paths:
-        restore_result = subprocess.run(
-            [
-                git_executable,
-                "-C",
-                str(project.install_dir),
-                "restore",
-                "--staged",
-                "--worktree",
-                "--",
-                *tracked_paths,
-            ],
-            cwd=str(WORKSPACE_DIR),
-            capture_output=True,
-            text=True,
-        )
-        if restore_result.returncode != 0:
-            error_output = (
-                restore_result.stderr.strip()
-                or restore_result.stdout.strip()
-                or "git restore failed."
-            )
-            raise RuntimeError(
-                f"Could not clean generated Python cache files before updating {project.display_name}.\n\n"
-                f"{error_output}"
-            )
-
-    for relative_path in untracked_paths:
-        target = project.install_dir / Path(relative_path)
-        if not target.exists():
-            continue
-        if target.is_dir():
-            shutil.rmtree(target)
-        else:
-            target.unlink()
+    return installed_commit
 
 
 def ensure_external_project(project: ManagedProject) -> Path:
@@ -209,44 +179,8 @@ def ensure_external_project(project: ManagedProject) -> Path:
         return project.run_path
 
     EXTERNAL_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-    errors: list[str] = []
-
-    git_executable = shutil.which("git")
-    if git_executable:
-        _clear_install_target(project.install_dir)
-        clone_result = subprocess.run(
-            [git_executable, "clone", "--depth", "1", project.repo_url, str(project.install_dir)],
-            cwd=str(WORKSPACE_DIR),
-            capture_output=True,
-            text=True,
-        )
-        if clone_result.returncode == 0 and project.run_path.exists():
-            return project.run_path
-        _clear_install_target(project.install_dir)
-        error_output = clone_result.stderr.strip() or clone_result.stdout.strip() or "git clone failed."
-        errors.append(f"git clone: {error_output}")
-    else:
-        errors.append("git clone: Git is not installed or not on PATH.")
-
-    try:
-        _clear_install_target(project.install_dir)
-        _download_project_archive(project, project.install_dir)
-    except Exception as exc:
-        _clear_install_target(project.install_dir)
-        errors.append(f"zip download: {exc}")
-    else:
-        if project.run_path.exists():
-            return project.run_path
-        _clear_install_target(project.install_dir)
-        errors.append(
-            f"zip download: install completed but {project.entry_script} was missing afterwards."
-        )
-
-    details = "\n\n".join(errors)
-    raise RuntimeError(
-        f"Could not download the {project.display_name} project from {project.repo_url}.\n\n"
-        f"{details}"
-    )
+    _install_project_into_dir(project, project.install_dir)
+    return project.run_path
 
 
 def update_external_project(project: ManagedProject) -> str:
@@ -254,57 +188,13 @@ def update_external_project(project: ManagedProject) -> str:
         ensure_external_project(project)
         return f"Installed {project.display_name} into {project.relative_install_dir}."
 
-    git_executable = shutil.which("git")
-    has_git_checkout = (project.install_dir / ".git").exists()
-    if git_executable and has_git_checkout:
-        changes = _project_local_changes(project, git_executable)
-        if changes:
-            _discard_transient_project_changes(project, git_executable, changes)
-            changes = _project_local_changes(project, git_executable)
-
-        if changes:
-            display_paths = "\n".join(
-                f"- {path}"
-                for _status, path in changes[:8]
-            )
-            if len(changes) > 8:
-                display_paths += "\n- ..."
-            raise RuntimeError(
-                f"{project.display_name} has local changes in {project.relative_install_dir}, so the launcher "
-                "will not auto-update it. Commit, stash, or remove those changes first.\n\n"
-                f"Blocking files:\n{display_paths}"
-            )
-
-        old_head_result = subprocess.run(
-            [git_executable, "-C", str(project.install_dir), "rev-parse", "HEAD"],
-            cwd=str(WORKSPACE_DIR),
-            capture_output=True,
-            text=True,
+    installed_commit = _replace_project_with_latest(project)
+    if installed_commit:
+        return (
+            f"Replaced {project.display_name} with a fresh upstream copy at commit "
+            f"{installed_commit[:7]}."
         )
-        pull_result = subprocess.run(
-            [git_executable, "-C", str(project.install_dir), "pull", "--ff-only"],
-            cwd=str(WORKSPACE_DIR),
-            capture_output=True,
-            text=True,
-        )
-        if pull_result.returncode != 0:
-            error_output = pull_result.stderr.strip() or pull_result.stdout.strip() or "git pull failed."
-            raise RuntimeError(f"Could not update {project.display_name}.\n\n{error_output}")
-
-        new_head_result = subprocess.run(
-            [git_executable, "-C", str(project.install_dir), "rev-parse", "HEAD"],
-            cwd=str(WORKSPACE_DIR),
-            capture_output=True,
-            text=True,
-        )
-        old_head = old_head_result.stdout.strip()
-        new_head = new_head_result.stdout.strip()
-        if old_head and new_head and old_head != new_head:
-            return f"Updated {project.display_name} to commit {new_head[:7]}."
-        return f"{project.display_name} is already up to date."
-
-    _replace_project_from_archive(project)
-    return f"Refreshed {project.display_name} from the latest GitHub archive."
+    return f"Replaced {project.display_name} with the latest GitHub archive snapshot."
 
 
 def ensure_rocket_project() -> Path:

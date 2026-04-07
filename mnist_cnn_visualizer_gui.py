@@ -14,6 +14,8 @@ from tkinter import messagebox, ttk
 
 import numpy as np
 
+from torch_device_utils import resolve_torch_device
+
 try:
     import torch
     import torch.nn as nn
@@ -456,7 +458,9 @@ class MnistTrainingEngine:
 
         self.config = config
         self.data_dir = data_dir
-        self.device = torch.device("cpu")
+        self.device_info = resolve_torch_device()
+        self.device_warning: str | None = self.device_info.reason
+        self.device = torch.device(self.device_info.torch_device)
         self.metric_queue: queue.Queue[MetricPoint] = queue.Queue()
         self.model_lock = threading.Lock()
         self.pause_event = threading.Event()
@@ -477,7 +481,18 @@ class MnistTrainingEngine:
         self.train_loader = DataLoader(self.train_dataset, batch_size=config.batch_size, shuffle=True)
         self.test_loader = DataLoader(self.test_dataset, batch_size=config.batch_size, shuffle=False)
 
-        self.model = MnistCNN(config.conv_layers, config.dense_layers, config.activation).to(self.device)
+        self.model = MnistCNN(config.conv_layers, config.dense_layers, config.activation)
+        try:
+            self.model = self.model.to(self.device)
+        except Exception as exc:
+            failed_device = self.device_info.label
+            self.device_info = resolve_torch_device("cpu")
+            self.device = torch.device(self.device_info.torch_device)
+            self.model = self.model.to(self.device)
+            self.device_warning = (
+                f"PyTorch reported {failed_device}, but model initialization on that backend failed. "
+                f"Training will continue on CPU.\n\nDetails: {exc}"
+            )
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
@@ -1241,7 +1256,13 @@ class MnistVisualizerApp:
         self.current_snapshot = None
         self.engine.start()
         self._refresh_snapshot()
-        self.status_var.set("Training is running. Pause to browse individual test samples more deliberately.")
+        if self.engine.device_warning:
+            self.status_var.set(self.engine.device_warning)
+        else:
+            self.status_var.set(
+                f"Training is running on {self.engine.device_info.label}. "
+                "Pause to browse individual test samples more deliberately."
+            )
         self._update_button_states()
         self._redraw_network()
 
